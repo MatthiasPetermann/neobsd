@@ -1,0 +1,28 @@
+# shell build profile for scripts/run-pipeline.sh
+
+TARGET="neobsd-11"
+
+GIT_COMMITTER_NAME="NeoBSD Builder"
+GIT_COMMITTER_EMAIL="builder@builder.lan"
+
+SRC_DIR="/build/netbsd-src"
+XSRC_DIR="/build/netbsd-xsrc"
+
+SRC_REPO="https://github.com/NetBSD/src.git"
+XSRC_REPO="https://github.com/NetBSD/xsrc.git"
+FETCH_MODE="auto"
+
+MACHINE="amd64"
+MACHINE_ARCHITECTURE="x86_64"
+BUILD_STEPS="all"
+NO_X=0
+REUSE_TOOLS=1
+TOOLS_ROOT="/build/tools"
+
+# Optional examples:
+JOBS="8"
+# RELEASE_TAG="26.0"  # next year: 27.0, then 28.0, ...
+OBJ_ROOT="/build/obj"
+
+PUBLISH_MODE="copy"
+PUBLISH_DIR="/dist"
