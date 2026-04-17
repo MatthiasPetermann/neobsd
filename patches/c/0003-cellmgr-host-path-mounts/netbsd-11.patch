@@ -1,0 +1,361 @@
+From e39cb910d5bae01c1faa99a9e9f0360e72bfc70c Mon Sep 17 00:00:00 2001
+From: Matthias Petermann <mp@petermann-it.de>
+Date: Fri, 17 Apr 2026 16:41:14 +0200
+Subject: [PATCH] cellmgr: add optional host-path nullfs mounts for cell mounts
+
+Extend cell mount specs to accept either managed volume names or absolute host paths.
+Gate host-path mounts behind CELL_ALLOW_HOST_MOUNTS=YES (default: NO), keep existing
+target safety checks, and update runtime mount handling, help output, man page, and
+example configuration/docs.
+---
+ etc/cellmgr.conf                              |   5 +
+ usr.sbin/cellmgr/README.md                    |   7 +-
+ usr.sbin/cellmgr/cellmgr                      | 100 ++++++++++++++----
+ usr.sbin/cellmgr/cellmgr.8                    |  22 +++-
+ usr.sbin/cellmgr/examples/README              |   3 +-
+ usr.sbin/cellmgr/examples/cellmgr.conf.sample |   5 +
+ .../cellmgr/examples/manifest.cell.sample     |   5 +-
+ 7 files changed, 120 insertions(+), 27 deletions(-)
+
+diff --git a/etc/cellmgr.conf b/etc/cellmgr.conf
+index 13699f77204b..f3cb446c69a0 100644
+--- a/etc/cellmgr.conf
++++ b/etc/cellmgr.conf
+@@ -24,6 +24,11 @@ CELL_RELEASE_DIR=/var/cellmgr/releases
+ # Declarative source-of-truth root used by `cellmgr apply`
+ CELLMGR_MANIFEST_DIR=/etc/cellmgr
+ 
++# Allow mount specs with absolute host paths in CELL_VOLUME_MOUNTS
++# (for example /srv/storage:/data:rw). Keep NO to restrict mounts
++# to named volumes managed by cellmgr.
++CELL_ALLOW_HOST_MOUNTS=NO
++
+ # Package source for declarative APPLY plans.
+ # PKG_RELEASE is normalized to major.minor by default (without suffixes).
+ # Example normalized path:
+diff --git a/usr.sbin/cellmgr/README.md b/usr.sbin/cellmgr/README.md
+index 21f6d5a3e78e..a05d7fb4885e 100644
+--- a/usr.sbin/cellmgr/README.md
++++ b/usr.sbin/cellmgr/README.md
+@@ -1,7 +1,7 @@
+ # cellmgr v2 CLI
+ 
+ `cellmgr` exposes a unified resource-oriented CLI for desired and runtime
+-cell/volume/storage operations.
++cell/volume operations.
+ 
+ Each cell uses a writable overlay mounted at `/.overlay` inside the cell root.
+ Standard writable paths (`/etc`, `/var`, `/tmp`, `/home`, `/root`,
+@@ -38,6 +38,11 @@ Mutations accept `--scope`:
+ - `runtime`: runtime state only
+ - `both`: desired + runtime effect
+ 
++Mount specs in `--mount` and `CELL_VOLUME_MOUNTS` use:
++
++- `<volume|/host/path>:<target>[:ro|rw]`
++- host-path sources require `CELL_ALLOW_HOST_MOUNTS=YES` in `/etc/cellmgr.conf`
++
+ Typical examples:
+ 
+ ```sh
+diff --git a/usr.sbin/cellmgr/cellmgr b/usr.sbin/cellmgr/cellmgr
+index 8ad35b67ce98..4ec229d30736 100755
+--- a/usr.sbin/cellmgr/cellmgr
++++ b/usr.sbin/cellmgr/cellmgr
+@@ -134,6 +134,7 @@ CELL_LOCAL_DEV=YES
+ CELL_DEV_SIZE=8m
+ CELL_DEVICES="std ptm"
+ CELL_PTYFS=YES
++CELL_ALLOW_HOST_MOUNTS=NO
+ 
+ if [ -r "${CONF_FILE}" ]; then
+ 	# shellcheck disable=SC1090
+@@ -177,6 +178,10 @@ if [ -z "${PKG_PATH:-}" ]; then
+ 	PKG_PATH="${PKG_MIRROR%/}/${PKG_ARCH}/${PKG_RELEASE}/All"
+ fi
+ 
++if [ -z "${CELL_ALLOW_HOST_MOUNTS:-}" ]; then
++	CELL_ALLOW_HOST_MOUNTS=NO
++fi
++
+ write_default_conf() {
+ 	if [ -r "${CONF_FILE}" ]; then
+ 		return
+@@ -199,6 +204,9 @@ CELL_VOLUME_DIR=${CELL_VOLUME_DIR}
+ CELL_BACKUP_DIR=${CELL_BACKUP_DIR}
+ CELL_RELEASE_DIR=${CELL_RELEASE_DIR}
+ CELLMGR_MANIFEST_DIR=${CELLMGR_MANIFEST_DIR}
++# Allow CELL_VOLUME_MOUNTS sources with absolute host paths.
++# Keep NO to restrict mounts to named cellmgr volumes.
++CELL_ALLOW_HOST_MOUNTS=${CELL_ALLOW_HOST_MOUNTS}
+ 
+ # Package source used by declarative APPLY directives (PKG).
+ # PKG_RELEASE is normalized to major.minor without suffixes.
+@@ -308,6 +316,8 @@ Convergence:
+ Notes:
+   - Default output is human-readable tables.
+   - With -T, output is stable TSV and includes a header unless -H is set.
++  - --mount accepts <volume|/host/path>:/target[:ro|rw].
++    Host paths require CELL_ALLOW_HOST_MOUNTS=YES.
+   - Destructive --all/--orphans operations require --yes when non-interactive.
+ 
+ Paths:
+@@ -714,6 +724,12 @@ normalize_volume_mode() {
+ parse_volume_mount_spec() {
+ 	spec=$1
+ 	spec_ctx=$2
++	MOUNT_SOURCE_KIND=
++	MOUNT_SOURCE=
++	MOUNT_VOLUME=
++	MOUNT_HOST_PATH=
++	MOUNT_TARGET=
++	MOUNT_MODE=
+ 
+ 	set -f
+ 	old_ifs=${IFS}
+@@ -723,19 +739,37 @@ parse_volume_mount_spec() {
+ 	set +f
+ 
+ 	if [ $# -eq 2 ]; then
+-		MOUNT_VOLUME=$1
++		MOUNT_SOURCE=$1
+ 		MOUNT_TARGET=$2
+ 		MOUNT_MODE=rw
+ 	elif [ $# -eq 3 ]; then
+-		MOUNT_VOLUME=$1
++		MOUNT_SOURCE=$1
+ 		MOUNT_TARGET=$2
+ 		MOUNT_MODE=$3
+ 	else
+-		echo "${spec_ctx}: invalid CELL_VOLUME_MOUNTS entry: ${spec}" >&2
++		echo "${spec_ctx}: invalid mount entry: ${spec}" >&2
++		echo "${spec_ctx}: expected <volume|/host/path>:/target[:ro|rw]" >&2
+ 		return 1
+ 	fi
+ 
+-	assert_valid_volume_name "${MOUNT_VOLUME}"
++	case "${MOUNT_SOURCE}" in
++	/*)
++		MOUNT_SOURCE_KIND=hostpath
++		MOUNT_HOST_PATH=${MOUNT_SOURCE}
++		case "${MOUNT_HOST_PATH}" in
++		/)
++			echo "${spec_ctx}: host mount source is not allowed: ${MOUNT_HOST_PATH}" >&2
++			return 1
++			;;
++		esac
++		;;
++	*)
++		MOUNT_SOURCE_KIND=volume
++		MOUNT_VOLUME=${MOUNT_SOURCE}
++		assert_valid_volume_name "${MOUNT_VOLUME}"
++		;;
++	esac
++
+ 	case "${MOUNT_TARGET}" in
+ 	/*)
+ 		;;
+@@ -787,13 +821,20 @@ validate_cell_volume_mounts() {
+ 	for spec in $(normalize_volume_mount_list "${mount_list}"); do
+ 		parse_volume_mount_spec "${spec}" "${origin}" || return 1
+ 
+-		if [ "${require_volume_manifest}" = "YES" ]; then
++		if [ "${MOUNT_SOURCE_KIND}" = "volume" ] &&
++		   [ "${require_volume_manifest}" = "YES" ]; then
+ 			if ! volume_manifest_exists "${MOUNT_VOLUME}"; then
+ 				echo "${origin}: referenced volume not found: ${MOUNT_VOLUME}" >&2
+ 				return 1
+ 			fi
+ 		fi
+ 
++		if [ "${MOUNT_SOURCE_KIND}" = "hostpath" ] &&
++		   [ "${CELL_ALLOW_HOST_MOUNTS:-NO}" != "YES" ]; then
++			echo "${origin}: host-path mounts are disabled (set CELL_ALLOW_HOST_MOUNTS=YES in ${CONF_FILE})" >&2
++			return 1
++		fi
++
+ 		for existing_target in ${seen_targets}; do
+ 			if path_is_same_or_child "${MOUNT_TARGET}" "${existing_target}" ||
+ 			   path_is_same_or_child "${existing_target}" "${MOUNT_TARGET}"; then
+@@ -806,7 +847,7 @@ validate_cell_volume_mounts() {
+ 		if [ -n "${CELL_VOLUME_MOUNTS_NORMALIZED}" ]; then
+ 			CELL_VOLUME_MOUNTS_NORMALIZED="${CELL_VOLUME_MOUNTS_NORMALIZED},"
+ 		fi
+-		CELL_VOLUME_MOUNTS_NORMALIZED="${CELL_VOLUME_MOUNTS_NORMALIZED}${MOUNT_VOLUME}:${MOUNT_TARGET}:${MOUNT_MODE}"
++		CELL_VOLUME_MOUNTS_NORMALIZED="${CELL_VOLUME_MOUNTS_NORMALIZED}${MOUNT_SOURCE}:${MOUNT_TARGET}:${MOUNT_MODE}"
+ 	done
+ 
+ 	return 0
+@@ -2215,30 +2256,47 @@ mount_cell_volumes() {
+ 
+ 	for spec in $(normalize_volume_mount_list "${mount_specs}"); do
+ 		parse_volume_mount_spec "${spec}" "CELL_VOLUME_MOUNTS" || return 1
+-		if ! volume_manifest_exists "${MOUNT_VOLUME}"; then
+-			echo "missing referenced volume manifest: ${MOUNT_VOLUME}" >&2
+-			return 1
+-		fi
+-		if ! ensure_volume_runtime_from_manifest "${MOUNT_VOLUME}"; then
+-			for rollback_target in ${mounted_targets}; do
+-				rmpt="${ROOT_DIR}${rollback_target}"
+-				umount "${rmpt}" >/dev/null 2>&1 || true
+-			done
+-			return 1
++		if [ "${MOUNT_SOURCE_KIND}" = "volume" ]; then
++			if ! volume_manifest_exists "${MOUNT_VOLUME}"; then
++				echo "missing referenced volume manifest: ${MOUNT_VOLUME}" >&2
++				return 1
++			fi
++			if ! ensure_volume_runtime_from_manifest "${MOUNT_VOLUME}"; then
++				for rollback_target in ${mounted_targets}; do
++					rmpt="${ROOT_DIR}${rollback_target}"
++					umount "${rmpt}" >/dev/null 2>&1 || true
++				done
++				return 1
++			fi
++			volume_manifest_paths "${MOUNT_VOLUME}"
++			source_mount_path=${VOLUME_PATH}
++		else
++			if [ "${CELL_ALLOW_HOST_MOUNTS:-NO}" != "YES" ]; then
++				echo "host-path mounts are disabled (set CELL_ALLOW_HOST_MOUNTS=YES in ${CONF_FILE})" >&2
++				return 1
++			fi
++			source_mount_path=${MOUNT_HOST_PATH}
++			if [ ! -d "${source_mount_path}" ]; then
++				echo "host mount source is not a directory: ${source_mount_path}" >&2
++				for rollback_target in ${mounted_targets}; do
++					rmpt="${ROOT_DIR}${rollback_target}"
++					umount "${rmpt}" >/dev/null 2>&1 || true
++				done
++				return 1
++			fi
+ 		fi
+-		volume_manifest_paths "${MOUNT_VOLUME}"
+ 
+ 		target_mount_point="${ROOT_DIR}${MOUNT_TARGET}"
+ 		mkdir -p "${target_mount_point}"
+ 		if mount | awk -v p="on ${target_mount_point} " 'index($0,p){found=1} END{exit !found}'; then
+-			if ! mount | awk -v p="${VOLUME_PATH} on ${target_mount_point} " 'index($0,p){found=1} END{exit !found}'; then
++			if ! mount | awk -v p="${source_mount_path} on ${target_mount_point} " 'index($0,p){found=1} END{exit !found}'; then
+ 				echo "volume target already mounted with different source: ${target_mount_point}" >&2
+ 				return 1
+ 			fi
+ 			continue
+ 		fi
+ 		if [ "${MOUNT_MODE}" = "ro" ]; then
+-			if ! mount -t null -o ro "${VOLUME_PATH}" "${target_mount_point}"; then
++			if ! mount -t null -o ro "${source_mount_path}" "${target_mount_point}"; then
+ 				for rollback_target in ${mounted_targets}; do
+ 					rmpt="${ROOT_DIR}${rollback_target}"
+ 					umount "${rmpt}" >/dev/null 2>&1 || true
+@@ -2246,7 +2304,7 @@ mount_cell_volumes() {
+ 				return 1
+ 			fi
+ 		else
+-			if ! mount -t null "${VOLUME_PATH}" "${target_mount_point}"; then
++			if ! mount -t null "${source_mount_path}" "${target_mount_point}"; then
+ 				for rollback_target in ${mounted_targets}; do
+ 					rmpt="${ROOT_DIR}${rollback_target}"
+ 					umount "${rmpt}" >/dev/null 2>&1 || true
+@@ -2371,7 +2429,7 @@ CELL_SUPERVISE_CMD="${escaped_supervise_cmd}"
+ # Declarative orchestration metadata:
+ CELL_DEPENDS_ON="${escaped_depends_on}"
+ CELL_HEALTHCHECK_CMD="${escaped_healthcheck_cmd}"
+-# Declarative volume mounts (<volume>:<target>:<ro|rw>):
++# Declarative mounts (<volume|/host/path>:<target>:<ro|rw>):
+ CELL_VOLUME_MOUNTS="${escaped_volume_mounts}"
+ CONF
+ }
+diff --git a/usr.sbin/cellmgr/cellmgr.8 b/usr.sbin/cellmgr/cellmgr.8
+index ead55a8dad37..de250a3f42e1 100644
+--- a/usr.sbin/cellmgr/cellmgr.8
++++ b/usr.sbin/cellmgr/cellmgr.8
+@@ -48,7 +48,7 @@
+ .Op Cm --rlimit-core Ar bytes|unlimited
+ .Op Cm --depends-on Ar dep[,dep...]
+ .Op Cm --healthcheck Ar command
+-.Op Cm --mount Ar volume:/target[:ro|rw]
++.Op Cm --mount Ar source:/target[:ro|rw]
+ .Op Cm --log-facility Ar facility
+ .Op Cm --stdout-level Ar level
+ .Op Cm --stderr-level Ar level
+@@ -67,7 +67,7 @@
+ .Op Cm --rlimit-core Ar bytes|unlimited
+ .Op Cm --depends-on Ar dep[,dep...]
+ .Op Cm --healthcheck Ar command
+-.Op Cm --mount Ar volume:/target[:ro|rw]
++.Op Cm --mount Ar source:/target[:ro|rw]
+ .Op Cm --log-facility Ar facility
+ .Op Cm --stdout-level Ar level
+ .Op Cm --stderr-level Ar level
+@@ -323,6 +323,24 @@ Update desired cell manifest values.
+ With
+ .Cm --scope both ,
+ run targeted convergence for the updated cell.
++.Pp
++Mount specs passed via
++.Cm --mount
++or
++.Va CELL_VOLUME_MOUNTS
++use
++.Ar source:/target[:ro|rw] .
++.Ar source
++may be either a named volume
++.Pq for example, Ql data
++or an absolute host path
++.Pq for example, Ql /srv/storage .
++Host-path sources are accepted only when
++.Va CELL_ALLOW_HOST_MOUNTS
++is set to
++.Dq YES
++in
++.Pa /etc/cellmgr.conf .
+ .It Cm cell Cm remove Ar name|--all|--orphans Op Ar remove-options
+ Remove desired and/or runtime cell state according to
+ .Cm --scope .
+diff --git a/usr.sbin/cellmgr/examples/README b/usr.sbin/cellmgr/examples/README
+index 03598087f4a3..63e3338cdcef 100644
+--- a/usr.sbin/cellmgr/examples/README
++++ b/usr.sbin/cellmgr/examples/README
+@@ -102,7 +102,8 @@ Attach in a cell manifest:
+ CELL_VOLUME_MOUNTS="demo-webroot:/var/www/demo:rw"
+ ```
+ 
+-`<volume>:<target>[:ro|rw]` is required per entry.
++`<volume|/host/path>:<target>[:ro|rw]` is required per entry.
++Host-path sources require `CELL_ALLOW_HOST_MOUNTS=YES` in `/etc/cellmgr.conf`.
+ 
+ 
+ ## Example stacks in this directory
+diff --git a/usr.sbin/cellmgr/examples/cellmgr.conf.sample b/usr.sbin/cellmgr/examples/cellmgr.conf.sample
+index 723909161087..bb75c09eaa72 100644
+--- a/usr.sbin/cellmgr/examples/cellmgr.conf.sample
++++ b/usr.sbin/cellmgr/examples/cellmgr.conf.sample
+@@ -21,6 +21,11 @@ CELL_RELEASE_DIR=/var/cellmgr/releases
+ # Declarative source-of-truth root used by `cellmgr apply`
+ CELLMGR_MANIFEST_DIR=/etc/cellmgr
+ 
++# Allow mount specs with absolute host paths in CELL_VOLUME_MOUNTS
++# (for example /srv/storage:/data:rw). Keep NO to restrict mounts
++# to named volumes managed by cellmgr.
++CELL_ALLOW_HOST_MOUNTS=NO
++
+ # Package source for declarative APPLY plans.
+ # PKG_RELEASE is normalized to major.minor by default (without suffixes).
+ # Example normalized path:
+diff --git a/usr.sbin/cellmgr/examples/manifest.cell.sample b/usr.sbin/cellmgr/examples/manifest.cell.sample
+index da30ca92fbed..22d100aeae21 100644
+--- a/usr.sbin/cellmgr/examples/manifest.cell.sample
++++ b/usr.sbin/cellmgr/examples/manifest.cell.sample
+@@ -23,6 +23,7 @@ CELL_SUPERVISE_CMD="/usr/libexec/httpd -I 8080 -X -s -f /var/www/example"
+ CELL_DEPENDS_ON=""
+ CELL_HEALTHCHECK_CMD="test -f /var/www/example/index.html"
+ 
+-# Optional volume mounts (<volume>:<target>[:ro|rw])
+-# Volumes are defined as /etc/cellmgr/*.volume
++# Optional mounts (<volume|/host/path>:<target>[:ro|rw])
++# Volumes are defined as /etc/cellmgr/*.volume.
++# Host-path sources require CELL_ALLOW_HOST_MOUNTS=YES in /etc/cellmgr.conf.
+ CELL_VOLUME_MOUNTS=""
+-- 
+2.47.3
+
