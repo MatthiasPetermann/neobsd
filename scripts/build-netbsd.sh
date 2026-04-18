@@ -14,6 +14,8 @@ TOOLS_DIR="${TOOLS_DIR:-${TOOLDIR:-}}"
 NO_X="${NO_X:-1}"
 JOBS="${JOBS:-}"
 REUSE_TOOLS="${REUSE_TOOLS:-0}"
+BUILD_INFO=""
+BUILD_ID=""
 
 detect_jobs() {
   if command -v getconf >/dev/null 2>&1; then
@@ -57,6 +59,8 @@ options:
   --xsrc-dir <path>     netbsd-xsrc directory (default: ../netbsd-xsrc)
   --tools-dir <path>    explicit tooldir path (optional)
   --reuse-tools <bool>  skip tools build if tools already exist (default: 0)
+  --build-info <text>   pass BUILDINFO to build.sh environment (optional)
+  --build-id <id>       pass build.sh -B value (optional)
   --jobs <n>            build parallelism (default: auto-detect)
   --no-x                build without X11 (default)
   --with-x              build with X11 (passes -x and uses --xsrc-dir)
@@ -107,6 +111,16 @@ while [ "$#" -gt 0 ]; do
     --reuse-tools)
       [ "$#" -ge 2 ] || die "missing value for --reuse-tools"
       REUSE_TOOLS="$(bool_to_01 "$2")"
+      shift 2
+      ;;
+    --build-info)
+      [ "$#" -ge 2 ] || die "missing value for --build-info"
+      BUILD_INFO="$2"
+      shift 2
+      ;;
+    --build-id)
+      [ "$#" -ge 2 ] || die "missing value for --build-id"
+      BUILD_ID="$2"
       shift 2
       ;;
     --jobs)
@@ -218,6 +232,8 @@ info "jobs: $JOBS"
 info "obj: $OBJ_DIR"
 info "tools: ${TOOLS_DIR:-<auto>}"
 info "reuse_tools: $REUSE_TOOLS"
+info "build info: ${BUILD_INFO:-<none>}"
+info "build id: ${BUILD_ID:-<none>}"
 info "no_x: $NO_X"
 info "xsrc: $XSRC_DIR"
 info "steps: $STEPS"
@@ -232,6 +248,10 @@ run_step() {
     -O "$OBJ_DIR" \
     -j "$JOBS" \
     -U
+
+  if [ -n "$BUILD_ID" ]; then
+    set -- "$@" -B "$BUILD_ID"
+  fi
 
   if [ -n "$MACHINE_ARCHITECTURE" ]; then
     set -- "$@" -a "$MACHINE_ARCHITECTURE"
@@ -262,7 +282,11 @@ run_step() {
     info "tools reuse requested, but no reusable tools found in: $TOOLS_DIR"
   fi
 
-  "$SRC_DIR/build.sh" "$@" "$step_name"
+  if [ -n "$BUILD_INFO" ]; then
+    BUILDINFO="$BUILD_INFO" "$SRC_DIR/build.sh" "$@" "$step_name"
+  else
+    "$SRC_DIR/build.sh" "$@" "$step_name"
+  fi
 }
 
 for step_name in $STEPS; do

@@ -184,6 +184,24 @@ resolve_release_id() {
   RELEASE_ID="dev-$now-$sha"
 }
 
+resolve_build_metadata() {
+  build_version="$RELEASE_TAG"
+  if [ -z "$build_version" ]; then
+    build_version="$RELEASE_ID"
+  fi
+
+  BUILD_INFO=""
+  BUILD_ID=""
+
+  if [ -n "$BUILD_BRAND_NAME" ]; then
+    BUILD_INFO="$BUILD_BRAND_NAME $build_version"
+  fi
+
+  if [ -n "$BUILD_ID_PREFIX" ]; then
+    BUILD_ID="$BUILD_ID_PREFIX-$build_version"
+  fi
+}
+
 remove_path() {
   path="$1"
 
@@ -400,6 +418,11 @@ OBJ_DIR=""
 RELEASE_TAG=""
 RELEASE_ID=""
 
+BUILD_BRAND_NAME=""
+BUILD_ID_PREFIX=""
+BUILD_INFO=""
+BUILD_ID=""
+
 DO_BUILD="1"
 PUBLISH_MODE="none"
 PUBLISH_DIR=""
@@ -503,6 +526,7 @@ validate_release_tag "$RELEASE_TAG"
 [ -n "$TARGET" ] || die "missing target. pass --target or set TARGET in profile"
 
 resolve_release_id
+resolve_build_metadata
 
 TARGET_DIR="$ROOT/targets/$TARGET"
 BASE_FILE="$TARGET_DIR/base"
@@ -530,6 +554,10 @@ info "orchestrator"
 info "target: $TARGET"
 info "release tag: ${RELEASE_TAG:-<none>}"
 info "release id: $RELEASE_ID"
+info "build brand name: ${BUILD_BRAND_NAME:-<none>}"
+info "build id prefix: ${BUILD_ID_PREFIX:-<none>}"
+info "build info: ${BUILD_INFO:-<none>}"
+info "build id: ${BUILD_ID:-<none>}"
 info "profile: ${PROFILE_FILE:-<none>}"
 info "src repo: $SRC_REPO"
 info "src dir: $SRC_DIR"
@@ -591,6 +619,14 @@ if [ "$DO_BUILD" = "1" ]; then
 
   if [ -n "$TOOLS_DIR" ]; then
     set -- "$@" --tools-dir "$TOOLS_DIR"
+  fi
+
+  if [ -n "$BUILD_INFO" ]; then
+    set -- "$@" --build-info "$BUILD_INFO"
+  fi
+
+  if [ -n "$BUILD_ID" ]; then
+    set -- "$@" --build-id "$BUILD_ID"
   fi
 
   set -- "$@" --reuse-tools "$REUSE_TOOLS"

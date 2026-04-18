@@ -190,6 +190,10 @@ Example: `profiles/neobsd-11-amd64-x86_64`
 ```sh
 TARGET="neobsd-11"
 
+# Optional: build branding passed to netbsd build.sh
+BUILD_BRAND_NAME="NeoBSD"
+BUILD_ID_PREFIX="neobsd"
+
 # Optional: identity used by git am while applying patches
 GIT_COMMITTER_NAME="NeoBSD Builder"
 GIT_COMMITTER_EMAIL="builder@builder.lan"
@@ -225,6 +229,9 @@ Notes:
 - `BUILD_STEPS` accepts a space-separated list (`"release sourcesets"`), `all` expands to the default full sequence.
 - `MACHINE_ARCHITECTURE` maps to `build.sh -a`.
 - For `MACHINE=amd64`, use `MACHINE_ARCHITECTURE=x86_64`.
+- `BUILD_BRAND_NAME` sets `BUILDINFO` for `build.sh` as `<brand> <release-tag-or-id>`.
+- `BUILD_ID_PREFIX` sets `build.sh -B` as `<prefix>-<release-tag-or-id>`.
+- If `BUILD_BRAND_NAME` or `BUILD_ID_PREFIX` are unset, pipeline does not pass those values to `build.sh`.
 - If the selected object path already exists, preflight aborts unless `--clean` is set.
 
 ### 4) Validate series
@@ -285,6 +292,8 @@ If `release_id` is not set:
 
 1. `release_tag` is used (if present)
 2. otherwise `dev-<utc-timestamp>-<shortsha>`
+
+Build metadata (`BUILDINFO` / `-B`) uses `release_tag` when available, otherwise `release_id`.
 
 ## Patch Set Keys
 

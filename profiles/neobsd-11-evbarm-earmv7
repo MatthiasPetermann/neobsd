@@ -2,6 +2,9 @@
 
 TARGET="neobsd-11"
 
+BUILD_BRAND_NAME="NeoBSD"
+BUILD_ID_PREFIX="neobsd"
+
 GIT_COMMITTER_NAME="NeoBSD Builder"
 GIT_COMMITTER_EMAIL="builder@builder.lan"
 
