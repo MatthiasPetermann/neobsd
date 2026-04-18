@@ -1,0 +1,511 @@
+From 54c1730e63ddee20e48b5186a75f8451db8ee559 Mon Sep 17 00:00:00 2001
+From: Matthias Petermann <mp@petermann-it.de>
+Date: Sat, 18 Apr 2026 13:03:28 +0200
+Subject: [PATCH] cellmgr: add COPY and UNTAR directives for host artifacts
+
+Add two declarative apply directives: COPY for transferring regular host files
+into a cell (with optional mode/owner/group) and UNTAR for extracting host
+tar.gz archives into absolute target directories.
+
+Resolve host source paths as absolute or relative to the apply plan location,
+and include referenced source content in apply hash computation so artifact
+changes trigger reconciliation without requiring --reapply. Update docs and
+examples to cover the new directives and behavior.
+---
+ doc/specs/netbsd-cells-developers-guide.txt   |   5 +-
+ doc/specs/netbsd-cells-operations-guide.txt   |   5 +-
+ doc/specs/netbsd-cells-specification.txt      |   5 +
+ usr.sbin/cellmgr/cellmgr                      | 276 +++++++++++++++++-
+ usr.sbin/cellmgr/cellmgr.8                    |  43 +++
+ usr.sbin/cellmgr/examples/README              |   6 +
+ .../cellmgr/examples/manifest.apply.sample    |   2 +
+ 7 files changed, 339 insertions(+), 3 deletions(-)
+
+diff --git a/doc/specs/netbsd-cells-developers-guide.txt b/doc/specs/netbsd-cells-developers-guide.txt
+index 4422336de7d8..146e5f443684 100644
+--- a/doc/specs/netbsd-cells-developers-guide.txt
++++ b/doc/specs/netbsd-cells-developers-guide.txt
+@@ -194,13 +194,16 @@ Core parser:
+ Execution helpers:
+ - `apply_exec_in_cell`
+ - `apply_write_block_file`
++- `apply_copy_host_file`
++- `apply_extract_host_tarball`
+ - `apply_patch_block`
+ 
+ Parser contracts:
+ - uppercase directive enforcement
+ - explicit block state machine for `FILE_BEGIN/FILE_END` and `PATCH_BEGIN/PATCH_END`
+-- strict option parsing for `DIR`, `FILE_BEGIN`, `PATCH_BEGIN`
++- strict option parsing for `DIR`, `COPY`, `UNTAR`, `FILE_BEGIN`, `PATCH_BEGIN`
+ - package token validation in `validate_pkg_name`
++- apply hash includes external host artifacts referenced by `COPY`/`UNTAR`
+ 
+ Runtime notes:
+ - `apply_cell_script` ensures cert store refresh via `certctl rehash`
+diff --git a/doc/specs/netbsd-cells-operations-guide.txt b/doc/specs/netbsd-cells-operations-guide.txt
+index 811b94161d0b..42d9a93c1889 100644
+--- a/doc/specs/netbsd-cells-operations-guide.txt
++++ b/doc/specs/netbsd-cells-operations-guide.txt
+@@ -112,11 +112,14 @@ Recommended production flow:
+ 5. Declarative apply plans (`*.apply`)
+ --------------------------------------
+ Supported directives:
+-- `PKG`, `EXEC`, `DIR`, `LINE`, `SYMLINK`, `FILE_BEGIN...FILE_END`, `PATCH_BEGIN...PATCH_END`
++- `PKG`, `EXEC`, `DIR`, `LINE`, `SYMLINK`, `COPY`, `UNTAR`, `FILE_BEGIN...FILE_END`, `PATCH_BEGIN...PATCH_END`
+ 
+ Rules that matter operationally:
+ - directives must be uppercase
+ - `FILE_BEGIN` and `PATCH_BEGIN` targets must be absolute paths
++- `UNTAR` target must be absolute
++- `COPY` and `UNTAR` host sources can be absolute or relative to the plan location
++- `COPY` and `UNTAR` source content contributes to apply hashing (changes auto-trigger apply)
+ - for stopped (`autostart=NO`) cells, plan execution is ephemeral (start/apply/stop)
+ 
+ Manual run for one cell:
+diff --git a/doc/specs/netbsd-cells-specification.txt b/doc/specs/netbsd-cells-specification.txt
+index 87a1dc3a6944..a12a79b1312d 100644
+--- a/doc/specs/netbsd-cells-specification.txt
++++ b/doc/specs/netbsd-cells-specification.txt
+@@ -133,6 +133,8 @@ Apply plan (`<name>.apply`) directives:
+ - `DIR <path> [mode=...] [owner=...] [group=...]`
+ - `LINE <path> | <text>`
+ - `SYMLINK <target> <linkpath>`
++- `COPY <host-source> <target> [mode=...] [owner=...] [group=...]`
++- `UNTAR <host-archive.tar.gz> <target-dir> [strip=n]`
+ - `FILE_BEGIN <path> [mode=...] [owner=...] [group=...]` ... `FILE_END`
+ - `PATCH_BEGIN <path> [strip=n]` ... `PATCH_END`
+ 
+@@ -140,6 +142,9 @@ Plan parser rules:
+ - directives must be uppercase
+ - blank lines and `#...` comments are ignored
+ - `FILE_BEGIN`/`PATCH_BEGIN` targets must be absolute paths
++- `UNTAR` target must be an absolute path
++- `COPY`/`UNTAR` host sources may be absolute or relative to the apply file directory
++- `COPY`/`UNTAR` source content is folded into apply hashing for drift detection
+ 
+ Volume manifest (`<name>.volume`) keys:
+ - `VOLUME_NAME`
+diff --git a/usr.sbin/cellmgr/cellmgr b/usr.sbin/cellmgr/cellmgr
+index 4ec229d30736..500b31fd2f1f 100755
+--- a/usr.sbin/cellmgr/cellmgr
++++ b/usr.sbin/cellmgr/cellmgr
+@@ -1708,6 +1708,8 @@ create_manifest_cell() {
+ #   LINE <path> | <text>
+ #   SYMLINK <target> <linkpath>
+ #   EXEC <command>
++#   COPY <host-source> <target> [mode=0644] [owner=user] [group=group]
++#   UNTAR <host-archive.tar.gz> <target-dir> [strip=0]
+ #   FILE_BEGIN <path> [mode=0644] [owner=user] [group=group]
+ #   ... block lines ...
+ #   FILE_END
+@@ -1717,6 +1719,8 @@ create_manifest_cell() {
+ 
+ # PKG postgresql16-server
+ # DIR /var/postgresql/data mode=0700 owner=pgsql group=pgsql
++# COPY ./assets/postgresql.conf /var/postgresql/data/postgresql.conf mode=0644 owner=pgsql group=pgsql
++# UNTAR ./assets/bootstrap-data.tar.gz /var/postgresql/data strip=1
+ # EXEC if [ ! -s /var/postgresql/data/PG_VERSION ]; then su -m pgsql -c '/usr/pkg/bin/initdb -D /var/postgresql/data'; fi
+ CONF
+ 	echo "Created manifest ${MANIFEST_CELL_CONF}"
+@@ -1988,6 +1992,83 @@ file_hash() {
+ 	cksum "${path}" | awk '{print $1 "-" $2}'
+ }
+ 
++apply_plan_hash() {
++	plan_file=$1
++	if [ ! -r "${plan_file}" ]; then
++		return 1
++	fi
++
++	hash_tmp=$(mktemp /tmp/cellmgr-apply-hash.XXXXXX)
++	if [ -z "${hash_tmp}" ] || [ ! -f "${hash_tmp}" ]; then
++		return 1
++	fi
++
++	plan_base_hash=$(file_hash "${plan_file}")
++	printf 'plan:%s\n' "${plan_base_hash}" > "${hash_tmp}"
++
++	block_active=NO
++	block_end_token=
++
++	while IFS= read -r raw_line || [ -n "${raw_line}" ]; do
++		if [ "${block_active}" = "YES" ]; then
++			line=$(trim_ws "${raw_line}")
++			if [ "${line}" = "${block_end_token}" ]; then
++				block_active=NO
++				block_end_token=
++			fi
++			continue
++		fi
++
++		line=$(trim_ws "${raw_line}")
++		[ -n "${line}" ] || continue
++		case "${line}" in
++		\#*)
++			continue
++			;;
++		esac
++
++		op=${line%%[[:space:]]*}
++		upper_op=$(printf '%s' "${op}" | tr '[:lower:]' '[:upper:]')
++		op=${upper_op}
++		if [ "${op}" = "${line}" ]; then
++			rest=
++		else
++			rest=$(trim_ws "${line#"${line%%[[:space:]]*}"}")
++		fi
++
++		case "${op}" in
++		FILE_BEGIN)
++			block_active=YES
++			block_end_token=FILE_END
++			;;
++		PATCH_BEGIN)
++			block_active=YES
++			block_end_token=PATCH_END
++			;;
++		COPY|UNTAR)
++			set -f
++			set -- ${rest}
++			set +f
++			[ $# -ge 1 ] || continue
++			source_path=$1
++			resolved_source=$(resolve_apply_host_path "${plan_file}" "${source_path}")
++			if [ -f "${resolved_source}" ] && [ -r "${resolved_source}" ]; then
++				source_hash=$(file_hash "${resolved_source}")
++				printf '%s:%s:%s\n' "${op}" "${resolved_source}" "${source_hash}" >> "${hash_tmp}"
++			elif [ -e "${resolved_source}" ]; then
++				printf '%s:%s:%s\n' "${op}" "${resolved_source}" "not-regular-or-unreadable" >> "${hash_tmp}"
++			else
++				printf '%s:%s:%s\n' "${op}" "${resolved_source}" "missing" >> "${hash_tmp}"
++			fi
++			;;
++		esac
++	done < "${plan_file}"
++
++	combined_hash=$(file_hash "${hash_tmp}")
++	rm -f "${hash_tmp}" || true
++	printf '%s\n' "${combined_hash}"
++}
++
+ state_read() {
+ 	state_file=$1
+ 	if [ -r "${state_file}" ]; then
+@@ -2645,6 +2726,23 @@ quote_sh() {
+ 	printf '%s' "$1" | sed -e "s/'/'\\\\''/g" -e "1s/^/'/" -e "\$s/\$/'/"
+ }
+ 
++resolve_apply_host_path() {
++	plan_file=$1
++	source_path=$2
++
++	case "${source_path}" in
++	/*)
++		resolved_path=${source_path}
++		;;
++	*)
++		plan_dir=$(dirname "${plan_file}")
++		resolved_path="${plan_dir}/${source_path}"
++		;;
++	esac
++
++	printf '%s\n' "${resolved_path}"
++}
++
+ validate_pkg_name() {
+ 	pkg=$1
+ 	case "${pkg}" in
+@@ -2719,6 +2817,111 @@ apply_write_block_file() {
+ 	return "${rc}"
+ }
+ 
++apply_copy_host_file() {
++	cell_cid=$1
++	plan_file=$2
++	source_path=$3
++	target_path=$4
++	mode=${5:-}
++	owner=${6:-}
++	group=${7:-}
++
++	case "${target_path}" in
++	/*)
++		;;
++	*)
++		echo "COPY target must be an absolute path: ${target_path}" >&2
++		return 1
++		;;
++	esac
++
++	resolved_source=$(resolve_apply_host_path "${plan_file}" "${source_path}")
++	if [ ! -e "${resolved_source}" ]; then
++		echo "COPY source not found on host: ${source_path} (resolved: ${resolved_source})" >&2
++		return 1
++	fi
++	if [ ! -f "${resolved_source}" ]; then
++		echo "COPY source must be a regular file: ${source_path} (resolved: ${resolved_source})" >&2
++		return 1
++	fi
++	if [ ! -r "${resolved_source}" ]; then
++		echo "COPY source is not readable: ${source_path} (resolved: ${resolved_source})" >&2
++		return 1
++	fi
++
++	apply_write_block_file "${cell_cid}" "${target_path}" "${resolved_source}" \
++	    "${mode}" "${owner}" "${group}"
++}
++
++apply_extract_host_tarball() {
++	cell_cid=$1
++	plan_file=$2
++	source_path=$3
++	target_dir=$4
++	strip_level=${5:-0}
++
++	case "${target_dir}" in
++	/*)
++		;;
++	*)
++		echo "UNTAR target must be an absolute path: ${target_dir}" >&2
++		return 1
++		;;
++	esac
++
++	case "${strip_level}" in
++	*[!0-9]*|"")
++		echo "UNTAR strip must be a non-negative integer: ${strip_level}" >&2
++		return 1
++		;;
++	esac
++
++	resolved_source=$(resolve_apply_host_path "${plan_file}" "${source_path}")
++	if [ ! -e "${resolved_source}" ]; then
++		echo "UNTAR source not found on host: ${source_path} (resolved: ${resolved_source})" >&2
++		return 1
++	fi
++	if [ ! -f "${resolved_source}" ]; then
++		echo "UNTAR source must be a regular file: ${source_path} (resolved: ${resolved_source})" >&2
++		return 1
++	fi
++	if [ ! -r "${resolved_source}" ]; then
++		echo "UNTAR source is not readable: ${source_path} (resolved: ${resolved_source})" >&2
++		return 1
++	fi
++
++	if command -v uuidgen >/dev/null 2>&1; then
++		archive_id=$(uuidgen | tr -d '-')
++	else
++		archive_id="$(date +%s)-$$"
++	fi
++
++	cell_tmp_archive="/tmp/cellmgr-apply-archive-${archive_id}.tar.gz"
++	host_stage_archive="${ROOT_DIR}${cell_tmp_archive}"
++	if ! cp "${resolved_source}" "${host_stage_archive}"; then
++		echo "failed to stage archive content for ${target_dir}" >&2
++		return 1
++	fi
++
++	qarchive=$(quote_sh "${cell_tmp_archive}")
++	qtarget=$(quote_sh "${target_dir}")
++
++	tar_cmd="tar -xzf ${qarchive} -C ${qtarget}"
++	if [ "${strip_level}" -gt 0 ]; then
++		tar_cmd="${tar_cmd} --strip-components=${strip_level}"
++	fi
++
++	cmd="command -v tar >/dev/null 2>&1 || { echo 'missing tar(1) in cell' >&2; exit 1; }; mkdir -p ${qtarget} || { rc=\$?; rm -f ${qarchive}; exit \${rc}; }; ${tar_cmd}; rc=\$?; rm -f ${qarchive}; exit \${rc}"
++
++	if apply_exec_in_cell "${cell_cid}" "${cmd}"; then
++		rc=0
++	else
++		rc=$?
++	fi
++	rm -f "${host_stage_archive}" || true
++	return "${rc}"
++}
++
+ apply_patch_block() {
+ 	cell_cid=$1
+ 	target_path=$2
+@@ -2951,6 +3154,74 @@ apply_declarative_plan() {
+ 			qlink=$(quote_sh "$2")
+ 			apply_exec_in_cell "${cell_cid}" "ln -snf ${qtarget} ${qlink}" || return 1
+ 			;;
++		COPY)
++			[ -n "${rest}" ] || {
++				echo "${plan_file}:${line_no}: COPY requires '<host-source> <target>'" >&2
++				return 1
++			}
++			set -f
++			set -- ${rest}
++			set +f
++			if [ $# -lt 2 ]; then
++				echo "${plan_file}:${line_no}: COPY requires '<host-source> <target>'" >&2
++				return 1
++			fi
++			source_path=$1
++			target_path=$2
++			shift 2
++			mode=
++			owner=
++			group=
++			for opt in "$@"; do
++				case "${opt}" in
++				mode=*)
++					mode=${opt#mode=}
++					;;
++				owner=*)
++					owner=${opt#owner=}
++					;;
++				group=*)
++					group=${opt#group=}
++					;;
++				*)
++					echo "${plan_file}:${line_no}: unknown COPY option: ${opt}" >&2
++					return 1
++					;;
++				esac
++			done
++			apply_copy_host_file "${cell_cid}" "${plan_file}" "${source_path}" \
++			    "${target_path}" "${mode}" "${owner}" "${group}" || return 1
++			;;
++		UNTAR)
++			[ -n "${rest}" ] || {
++				echo "${plan_file}:${line_no}: UNTAR requires '<host-archive> <target-dir>'" >&2
++				return 1
++			}
++			set -f
++			set -- ${rest}
++			set +f
++			if [ $# -lt 2 ]; then
++				echo "${plan_file}:${line_no}: UNTAR requires '<host-archive> <target-dir>'" >&2
++				return 1
++			fi
++			source_path=$1
++			target_path=$2
++			shift 2
++			strip_level=0
++			for opt in "$@"; do
++				case "${opt}" in
++				strip=*)
++					strip_level=${opt#strip=}
++					;;
++				*)
++					echo "${plan_file}:${line_no}: unknown UNTAR option: ${opt}" >&2
++					return 1
++					;;
++				esac
++			done
++			apply_extract_host_tarball "${cell_cid}" "${plan_file}" \
++			    "${source_path}" "${target_path}" "${strip_level}" || return 1
++			;;
+ 		PATCH_BEGIN)
+ 			[ -n "${rest}" ] || {
+ 				echo "${plan_file}:${line_no}: PATCH_BEGIN requires a target path" >&2
+@@ -4905,7 +5176,10 @@ reconcile_one_cell() {
+ 	apply_needed=NO
+ 	apply_hash=
+ 	if [ -r "${MANIFEST_APPLY_FILE}" ]; then
+-		apply_hash=$(file_hash "${MANIFEST_APPLY_FILE}")
++		apply_hash=$(apply_plan_hash "${MANIFEST_APPLY_FILE}" || true)
++		if [ -z "${apply_hash}" ]; then
++			apply_hash=$(file_hash "${MANIFEST_APPLY_FILE}")
++		fi
+ 		prev_apply_hash=$(state_read "${apply_hash_file}")
+ 		if [ "${reapply}" = "YES" ] || [ "${apply_hash}" != "${prev_apply_hash}" ]; then
+ 			apply_needed=YES
+diff --git a/usr.sbin/cellmgr/cellmgr.8 b/usr.sbin/cellmgr/cellmgr.8
+index de250a3f42e1..330feaa57cdc 100644
+--- a/usr.sbin/cellmgr/cellmgr.8
++++ b/usr.sbin/cellmgr/cellmgr.8
+@@ -445,6 +445,49 @@ With
+ .Cm --dry-run ,
+ print the plan only and return exit status 2 when changes would be required.
+ .El
++.Sh APPLY PLAN DIRECTIVES
++Apply plans are line-oriented files consumed by
++.Cm cell plan run
++and
++.Cm apply .
++Each non-empty, non-comment line starts with an uppercase directive.
++Supported directives are:
++.Bl -tag -width "PATCH_BEGIN path [strip=n]"
++.It Cm PKG Ar package ...
++Install package(s) when missing.
++.It Cm EXEC Ar command
++Run a shell command inside the cell.
++.It Cm DIR Ar path Op Cm mode=0755 Op Cm owner=user Op Cm group=group
++Create a directory and optionally set metadata.
++.It Cm LINE Ar path | text
++Append a line when it is not already present.
++.It Cm SYMLINK Ar target Ar linkpath
++Create or update a symbolic link.
++.It Cm COPY Ar host-source Ar target Op Cm mode=0644 Op Cm owner=user Op Cm group=group
++Copy one regular file from host into the cell.
++.Ar host-source
++may be absolute or relative to the directory that contains the apply plan.
++.It Cm UNTAR Ar host-archive.tar.gz Ar target-dir Op Cm strip=n
++Extract one host tar.gz archive inside the cell at
++.Ar target-dir .
++.Ar target-dir
++must be an absolute path.
++.It Cm FILE_BEGIN Ar path Op Cm mode=0644 Op Cm owner=user Op Cm group=group
++Start an inline file content block.
++Terminate with
++.Cm FILE_END .
++.It Cm PATCH_BEGIN Ar path Op Cm strip=n
++Start an inline unified diff block.
++Terminate with
++.Cm PATCH_END .
++.El
++For
++.Cm COPY
++and
++.Cm UNTAR ,
++source file content contributes to apply hashing, so source changes trigger an
++apply run without
++.Cm --reapply .
+ .Sh IPC PROTOCOL
+ The
+ .Cm ipc serve --stdio
+diff --git a/usr.sbin/cellmgr/examples/README b/usr.sbin/cellmgr/examples/README
+index 63e3338cdcef..a71fb6f8a840 100644
+--- a/usr.sbin/cellmgr/examples/README
++++ b/usr.sbin/cellmgr/examples/README
+@@ -135,6 +135,8 @@ Copy example manifests into `/etc/cellmgr` and run:
+ - `DIR <path> [mode=0755] [owner=user] [group=group]`
+ - `LINE <path> | <text>`
+ - `SYMLINK <target> <linkpath>`
++- `COPY <host-source> <target> [mode=0644] [owner=user] [group=group]`
++- `UNTAR <host-archive.tar.gz> <target-dir> [strip=0]`
+ - `FILE_BEGIN <path> [mode=0644] [owner=user] [group=group]`
+ - `FILE_END`
+ - `PATCH_BEGIN <path> [strip=0]`
+@@ -142,6 +144,10 @@ Copy example manifests into `/etc/cellmgr` and run:
+ 
+ Before executing each plan, `cellmgr` runs `certctl rehash` inside the target
+ cell and exports `PKG_PATH` for package operations.
++For `COPY` and `UNTAR`, host source paths may be absolute or relative to the
++`<name>.apply` directory.
++Host source content is part of the apply hash, so changing a referenced file
++triggers apply without `--reapply`.
+ 
+ 
+ ## Operational notes
+diff --git a/usr.sbin/cellmgr/examples/manifest.apply.sample b/usr.sbin/cellmgr/examples/manifest.apply.sample
+index c6ff03604366..03506c4f1a88 100644
+--- a/usr.sbin/cellmgr/examples/manifest.apply.sample
++++ b/usr.sbin/cellmgr/examples/manifest.apply.sample
+@@ -2,6 +2,8 @@
+ 
+ PKG nginx
+ DIR /var/www/example mode=0755
++# COPY ./assets/favicon.ico /var/www/example/favicon.ico mode=0644
++# UNTAR ./assets/site-content.tar.gz /var/www/example strip=1
+ EXEC [ -f /var/www/example/.bootstrapped ] || touch /var/www/example/.bootstrapped
+ FILE_BEGIN /var/www/example/index.html mode=0644
+ <!doctype html>
+-- 
+2.47.3
+
