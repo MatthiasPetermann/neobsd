@@ -1,0 +1,143 @@
+From e927fcc2e39b3dfcb2a801ddbe43d0c947ef85f6 Mon Sep 17 00:00:00 2001
+From: Matthias Petermann <mp@petermann-it.de>
+Date: Sun, 19 Apr 2026 09:40:05 +0200
+Subject: [PATCH] cellmgr: provide /opt via per-cell overlay for vendor
+ software
+
+Expose /opt in each cell as a writable path resolved through /.overlay,
+similar to /usr/pkg. This provides a dedicated location for third-party or
+vendor software that is not available via pkg/pkgsrc, with a predictable
+layout such as /opt/<app>/app and /opt/<app>/app.conf.
+
+Update manpages and specs to keep the overlay path documentation consistent.
+---
+ doc/specs/netbsd-cells-developers-guide.txt | 2 ++
+ doc/specs/netbsd-cells-operations-guide.txt | 2 ++
+ doc/specs/netbsd-cells-specification.txt    | 2 +-
+ usr.sbin/cellmgr/README.md                  | 2 +-
+ usr.sbin/cellmgr/cellmgr                    | 5 +++++
+ usr.sbin/cellmgr/cellmgr.8                  | 5 ++++-
+ 6 files changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/doc/specs/netbsd-cells-developers-guide.txt b/doc/specs/netbsd-cells-developers-guide.txt
+index 146e5f443684..653187ecdbf3 100644
+--- a/doc/specs/netbsd-cells-developers-guide.txt
++++ b/doc/specs/netbsd-cells-developers-guide.txt
+@@ -139,6 +139,8 @@ Runtime render/mount path:
+ - `mount_cell_root` / `umount_cell_root`
+ - `mount_cell_volumes` / `umount_cell_volumes`
+ - `setup_local_dev`
++- base writable links `/etc`, `/var`, `/tmp`, `/home`, `/root`, `/usr/pkg`, `/opt`
++  resolve through per-cell `/.overlay`
+ 
+ Lifecycle actions:
+ - `start_cell_internal`
+diff --git a/doc/specs/netbsd-cells-operations-guide.txt b/doc/specs/netbsd-cells-operations-guide.txt
+index 42d9a93c1889..6a089fee0e26 100644
+--- a/doc/specs/netbsd-cells-operations-guide.txt
++++ b/doc/specs/netbsd-cells-operations-guide.txt
+@@ -31,6 +31,8 @@ What bootstrap does:
+ - ensures `secmodel_cell` is loaded and persistent via `/etc/modules.conf`
+ - writes default `/etc/cellmgr.conf` when absent
+ - fetches release sets and builds the shared base layer
++- writable runtime paths `/etc`, `/var`, `/tmp`, `/home`, `/root`, `/usr/pkg`, and `/opt`
++  resolve via per-cell `/.overlay`
+ 
+ 
+ 2. Read workflows (day-1/day-2)
+diff --git a/doc/specs/netbsd-cells-specification.txt b/doc/specs/netbsd-cells-specification.txt
+index a12a79b1312d..5c3b0fa3be36 100644
+--- a/doc/specs/netbsd-cells-specification.txt
++++ b/doc/specs/netbsd-cells-specification.txt
+@@ -104,7 +104,7 @@ Default layout:
+ Runtime overlay model:
+ - shared base is mounted read-only at `<root>`
+ - per-cell writable layer is mounted at `<root>/.overlay`
+-- base paths `/etc`, `/var`, `/tmp`, `/home`, `/root`, `/usr/pkg` are symlinked
++- base paths `/etc`, `/var`, `/tmp`, `/home`, `/root`, `/usr/pkg`, `/opt` are symlinked
+   into `/.overlay`
+ 
+ 
+diff --git a/usr.sbin/cellmgr/README.md b/usr.sbin/cellmgr/README.md
+index a05d7fb4885e..c92e9e98b73b 100644
+--- a/usr.sbin/cellmgr/README.md
++++ b/usr.sbin/cellmgr/README.md
+@@ -5,7 +5,7 @@ cell/volume operations.
+ 
+ Each cell uses a writable overlay mounted at `/.overlay` inside the cell root.
+ Standard writable paths (`/etc`, `/var`, `/tmp`, `/home`, `/root`,
+-`/usr/pkg`) are symlinked into that overlay.
++`/usr/pkg`, `/opt`) are symlinked into that overlay.
+ 
+ ## Top-level commands
+ 
+diff --git a/usr.sbin/cellmgr/cellmgr b/usr.sbin/cellmgr/cellmgr
+index 500b31fd2f1f..486006cadc34 100755
+--- a/usr.sbin/cellmgr/cellmgr
++++ b/usr.sbin/cellmgr/cellmgr
+@@ -2171,6 +2171,7 @@ ensure_base_writable_links() {
+ 	rm -rf "${BASE_LAYER}/.data"
+ 	rm -rf "${BASE_LAYER}/etc" "${BASE_LAYER}/var" "${BASE_LAYER}/tmp" \
+ 		"${BASE_LAYER}/home" "${BASE_LAYER}/root" "${BASE_LAYER}/usr/pkg" \
++		"${BASE_LAYER}/opt" \
+ 		"${BASE_LAYER}/.cshrc" "${BASE_LAYER}/.profile"
+ 	ln -s ".overlay/etc" "${BASE_LAYER}/etc"
+ 	ln -s ".overlay/var" "${BASE_LAYER}/var"
+@@ -2180,6 +2181,7 @@ ensure_base_writable_links() {
+ 	ln -s ".overlay/.cshrc" "${BASE_LAYER}/.cshrc"
+ 	ln -s ".overlay/.profile" "${BASE_LAYER}/.profile"
+ 	ln -s "../.overlay/usr/pkg" "${BASE_LAYER}/usr/pkg"
++	ln -s ".overlay/opt" "${BASE_LAYER}/opt"
+ }
+ 
+ 
+@@ -2220,6 +2222,7 @@ cell_paths() {
+ 	DATA_HOME_DIR="${OVERLAY_DIR}/home"
+ 	DATA_ROOT_DIR="${OVERLAY_DIR}/root"
+ 	DATA_PKG_DIR="${OVERLAY_DIR}/usr/pkg"
++	DATA_OPT_DIR="${OVERLAY_DIR}/opt"
+ 	STATE_DIR="${CELL_DIR}/state"
+ 	CELL_CONF="${CELL_DIR}/cell.conf"
+ }
+@@ -2433,6 +2436,7 @@ umount_cell_volumes() {
+ # top of the shared read-only base layer.
+ mount_cell_root() {
+ 	ensure_base_writable_links
++	mkdir -p "${DATA_PKG_DIR}" "${DATA_OPT_DIR}"
+ 
+ 	if mount | awk -v p="on ${ROOT_DIR} " \
+ 	    'index($0,p){found=1} END{exit !found}'; then
+@@ -2538,6 +2542,7 @@ create_cell() {
+ 	cell_paths "${name}"
+ 	mkdir -p "${ROOT_DIR}" "${DATA_VAR_DIR}" "${DATA_TMP_DIR}" \
+ 		"${DATA_HOME_DIR}" "${DATA_ROOT_DIR}" "${DATA_PKG_DIR}" \
++		"${DATA_OPT_DIR}" \
+ 		"${DATA_VAR_DIR}/run" "${DATA_VAR_DIR}/log" "${STATE_DIR}"
+ 	chmod 1777 "${DATA_TMP_DIR}"
+ 	setup_etc
+diff --git a/usr.sbin/cellmgr/cellmgr.8 b/usr.sbin/cellmgr/cellmgr.8
+index 330feaa57cdc..d0bf0a21061e 100644
+--- a/usr.sbin/cellmgr/cellmgr.8
++++ b/usr.sbin/cellmgr/cellmgr.8
+@@ -221,7 +221,7 @@ Within each runtime cell root,
+ .Pa /.overlay
+ is mounted as the writable layer.
+ Common writable paths
+-.Pq Pa /etc , Pa /var , Pa /tmp , Pa /home , Pa /root , Pa /usr/pkg
++.Pq Pa /etc , Pa /var , Pa /tmp , Pa /home , Pa /root , Pa /usr/pkg , Pa /opt
+ resolve through that overlay.
+ .Pp
+ Storage backups are stored under
+@@ -563,6 +563,9 @@ Rendered runtime cell tree.
+ .It Pa /var/cellmgr/cells/*/overlay
+ Per-cell writable runtime overlay, mounted in-cell at
+ .Pa /.overlay .
++Common writable paths
++.Pq Pa /etc , Pa /var , Pa /tmp , Pa /home , Pa /root , Pa /usr/pkg , Pa /opt
++resolve through this mount.
+ .It Pa /var/cellmgr/volumes
+ Runtime volume directories.
+ .It Pa /var/backups/cellmgr/volumes
+-- 
+2.47.3
+
