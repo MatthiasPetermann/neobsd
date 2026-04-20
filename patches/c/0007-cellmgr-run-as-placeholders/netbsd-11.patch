@@ -1,0 +1,473 @@
+From 333c7cbbe46a058f0e416bb5ba7f40d684b50404 Mon Sep 17 00:00:00 2001
+From: Matthias Petermann <mp@petermann-it.de>
+Date: Mon, 20 Apr 2026 17:57:32 +0200
+Subject: [PATCH] cellmgr: support run-as ownership placeholders in apply plans
+
+Add owner=@run_uid and group=@run_gid support for DIR, COPY, and FILE_BEGIN so
+apply can set file ownership compatible with supervised run-as identities. Export
+CELLMGR_RUN_UID/GID/GROUPS for EXEC directives, include run-identity in apply
+hashing to trigger reapply on run-as changes, and update manpages and example
+configs.
+---
+ etc/cellmgr.conf                              |  11 ++
+ usr.sbin/cellmgr/cellmgr                      | 143 ++++++++++++++++--
+ usr.sbin/cellmgr/cellmgr.8                    |  55 ++++++-
+ usr.sbin/cellmgr/examples/README              |  13 +-
+ .../cellmgr/examples/manifest.apply.sample    |   4 +
+ .../cellmgr/examples/manifest.cell.sample     |   5 +
+ 6 files changed, 213 insertions(+), 18 deletions(-)
+
+diff --git a/etc/cellmgr.conf b/etc/cellmgr.conf
+index f3cb446c69a0..f0ba42c1c063 100644
+--- a/etc/cellmgr.conf
++++ b/etc/cellmgr.conf
+@@ -50,3 +50,14 @@ CELL_LOCAL_DEV=YES
+ CELL_DEV_SIZE=8m
+ CELL_DEVICES="std ptm"
+ CELL_PTYFS=YES
++
++# Per-cell create-time options are stored in each <name>.cell, including
++# CELL_CREATE_PROFILE, CELL_CREATE_RESERVED_PORTS, and optional
++# CELL_CREATE_RLIMIT_NOFILE / CELL_CREATE_RLIMIT_AS / CELL_CREATE_RLIMIT_CORE.
++
++# Per-cell supervise logging settings are stored in each <name>.cell:
++#   CELL_SUPERVISE_FACILITY (facility name, e.g. daemon/local0)
++#   CELL_SUPERVISE_STDOUT_LEVEL (emerg..debug or 0..7)
++#   CELL_SUPERVISE_STDERR_LEVEL (emerg..debug or 0..7)
++# Optional per-cell supervised credential drop:
++#   CELL_SUPERVISE_RUN_AS (host:user[:group] or uid:uid[:gid])
+diff --git a/usr.sbin/cellmgr/cellmgr b/usr.sbin/cellmgr/cellmgr
+index 99634ef1ce90..fef3afe671cd 100755
+--- a/usr.sbin/cellmgr/cellmgr
++++ b/usr.sbin/cellmgr/cellmgr
+@@ -241,6 +241,9 @@ RECONCILE_SILENT=NO
+ RECONCILE_LAST_SECTION=
+ RECONCILE_TARGET_NAMES=
+ CELLMGR_ASSUME_YES=NO
++APPLY_RUN_UID=
++APPLY_RUN_GID=
++APPLY_RUN_GROUPS=
+ 
+ usage() {
+ 	cat <<USAGE
+@@ -320,6 +323,7 @@ Notes:
+   - --mount accepts <volume|/host/path>:/target[:ro|rw].
+     Host paths require CELL_ALLOW_HOST_MOUNTS=YES.
+   - --run-as accepts host:user[:group] or uid:uid[:gid].
++  - apply owner/group options support @run_uid/@run_gid placeholders.
+   - Destructive --all/--orphans operations require --yes when non-interactive.
+ 
+ Paths:
+@@ -1987,18 +1991,21 @@ create_manifest_cell() {
+ #
+ # supported directives:
+ #   PKG <package>
+-#   DIR <path> [mode=0755] [owner=user] [group=group]
++#   DIR <path> [mode=0755] [owner=user|@run_uid] [group=group|@run_gid]
+ #   LINE <path> | <text>
+ #   SYMLINK <target> <linkpath>
+ #   EXEC <command>
+-#   COPY <host-source> <target> [mode=0644] [owner=user] [group=group]
++#   COPY <host-source> <target> [mode=0644] [owner=user|@run_uid] [group=group|@run_gid]
+ #   UNTAR <host-archive.tar.gz> <target-dir> [strip=0]
+-#   FILE_BEGIN <path> [mode=0644] [owner=user] [group=group]
++#   FILE_BEGIN <path> [mode=0644] [owner=user|@run_uid] [group=group|@run_gid]
+ #   ... block lines ...
+ #   FILE_END
+ #   PATCH_BEGIN <path> [strip=0]
+ #   ... unified diff snippet ...
+ #   PATCH_END
++#
++# apply exports these EXEC environment variables:
++#   CELLMGR_RUN_UID, CELLMGR_RUN_GID, CELLMGR_RUN_GROUPS
+ 
+ # PKG postgresql16-server
+ # DIR /var/postgresql/data mode=0700 owner=pgsql group=pgsql
+@@ -2286,6 +2293,9 @@ file_hash() {
+ 
+ apply_plan_hash() {
+ 	plan_file=$1
++	run_uid=${2:-}
++	run_gid=${3:-}
++	run_groups=${4:-}
+ 	if [ ! -r "${plan_file}" ]; then
+ 		return 1
+ 	fi
+@@ -2300,6 +2310,7 @@ apply_plan_hash() {
+ 
+ 	block_active=NO
+ 	block_end_token=
++	needs_run_identity_hash=NO
+ 
+ 	while IFS= read -r raw_line || [ -n "${raw_line}" ]; do
+ 		if [ "${block_active}" = "YES" ]; then
+@@ -2319,6 +2330,10 @@ apply_plan_hash() {
+ 			;;
+ 		esac
+ 
++		if apply_line_uses_run_identity "${line}"; then
++			needs_run_identity_hash=YES
++		fi
++
+ 		op=${line%%[[:space:]]*}
+ 		upper_op=$(printf '%s' "${op}" | tr '[:lower:]' '[:upper:]')
+ 		op=${upper_op}
+@@ -2356,6 +2371,10 @@ apply_plan_hash() {
+ 		esac
+ 	done < "${plan_file}"
+ 
++	if [ "${needs_run_identity_hash}" = "YES" ]; then
++		printf 'run-identity:%s:%s:%s\n' "${run_uid}" "${run_gid}" "${run_groups}" >> "${hash_tmp}"
++	fi
++
+ 	combined_hash=$(file_hash "${hash_tmp}")
+ 	rm -f "${hash_tmp}" || true
+ 	printf '%s\n' "${combined_hash}"
+@@ -3076,6 +3095,74 @@ quote_sh() {
+ 	printf '%s' "$1" | sed -e "s/'/'\\\\''/g" -e "1s/^/'/" -e "\$s/\$/'/"
+ }
+ 
++apply_line_uses_run_identity() {
++	line=$1
++	case "${line}" in
++	*'@run_uid'*|*'@run_gid'*|*'CELLMGR_RUN_UID'*|*'CELLMGR_RUN_GID'*|*'CELLMGR_RUN_GROUPS'*)
++		return 0
++		;;
++	esac
++	return 1
++}
++
++resolve_apply_owner_spec() {
++	owner_spec=${1:-}
++	owner_origin=${2:-apply owner}
++	[ -n "${owner_spec}" ] || return 0
++
++	case "${owner_spec}" in
++	@run_uid)
++		case "${APPLY_RUN_UID:-}" in
++		""|*[!0-9]*)
++			echo "${owner_origin}: owner=@run_uid requires resolved run uid (set CELL_SUPERVISE_RUN_AS and run apply first)" >&2
++			return 1
++			;;
++		esac
++		printf '%s\n' "${APPLY_RUN_UID}"
++		return 0
++		;;
++	@run_gid|@run_groups)
++		echo "${owner_origin}: unsupported owner token '${owner_spec}' (use @run_uid)" >&2
++		return 1
++		;;
++	*)
++		printf '%s\n' "${owner_spec}"
++		return 0
++		;;
++	esac
++}
++
++resolve_apply_group_spec() {
++	group_spec=${1:-}
++	group_origin=${2:-apply group}
++	[ -n "${group_spec}" ] || return 0
++
++	case "${group_spec}" in
++	@run_gid)
++		case "${APPLY_RUN_GID:-}" in
++		""|*[!0-9]*)
++			echo "${group_origin}: group=@run_gid requires resolved run gid (set CELL_SUPERVISE_RUN_AS and run apply first)" >&2
++			return 1
++			;;
++		esac
++		printf '%s\n' "${APPLY_RUN_GID}"
++		return 0
++		;;
++	@run_uid)
++		echo "${group_origin}: unsupported group token '@run_uid' (use @run_gid)" >&2
++		return 1
++		;;
++	@run_groups)
++		echo "${group_origin}: group=@run_groups expands to a list and cannot be used as a single file group (use EXEC with CELLMGR_RUN_GROUPS)" >&2
++		return 1
++		;;
++	*)
++		printf '%s\n' "${group_spec}"
++		return 0
++		;;
++	esac
++}
++
+ resolve_apply_host_path() {
+ 	plan_file=$1
+ 	source_path=$2
+@@ -3108,7 +3195,10 @@ apply_exec_in_cell() {
+ 	cell_cid=$1
+ 	action_cmd=$2
+ 	qpkg_path=$(quote_sh "${PKG_PATH}")
+-	cellctl exec "${cell_cid}" /bin/sh -c "export PKG_PATH=${qpkg_path}; ${action_cmd}"
++	qrun_uid=$(quote_sh "${APPLY_RUN_UID:-}")
++	qrun_gid=$(quote_sh "${APPLY_RUN_GID:-}")
++	qrun_groups=$(quote_sh "${APPLY_RUN_GROUPS:-}")
++	cellctl exec "${cell_cid}" /bin/sh -c "export PKG_PATH=${qpkg_path}; export CELLMGR_RUN_UID=${qrun_uid}; export CELLMGR_RUN_GID=${qrun_gid}; export CELLMGR_RUN_GROUPS=${qrun_groups}; ${action_cmd}"
+ }
+ 
+ apply_write_block_file() {
+@@ -3151,11 +3241,15 @@ apply_write_block_file() {
+ 		cmd="${cmd} && chmod ${mode} ${qtarget}"
+ 	fi
+ 	if [ -n "${owner}" ] && [ -n "${group}" ]; then
+-		cmd="${cmd} && chown ${owner}:${group} ${qtarget}"
++		qowner=$(quote_sh "${owner}")
++		qgroup=$(quote_sh "${group}")
++		cmd="${cmd} && chown ${qowner}:${qgroup} ${qtarget}"
+ 	elif [ -n "${owner}" ]; then
+-		cmd="${cmd} && chown ${owner} ${qtarget}"
++		qowner=$(quote_sh "${owner}")
++		cmd="${cmd} && chown ${qowner} ${qtarget}"
+ 	elif [ -n "${group}" ]; then
+-		cmd="${cmd} && chgrp ${group} ${qtarget}"
++		qgroup=$(quote_sh "${group}")
++		cmd="${cmd} && chgrp ${qgroup} ${qtarget}"
+ 	fi
+ 
+ 	if apply_exec_in_cell "${cell_cid}" "${cmd}"; then
+@@ -3454,17 +3548,27 @@ apply_declarative_plan() {
+ 					;;
+ 				esac
+ 			done
++			if [ -n "${owner}" ]; then
++				owner=$(resolve_apply_owner_spec "${owner}" "${plan_file}:${line_no}") || return 1
++			fi
++			if [ -n "${group}" ]; then
++				group=$(resolve_apply_group_spec "${group}" "${plan_file}:${line_no}") || return 1
++			fi
+ 			qpath=$(quote_sh "${path}")
+ 			cmd="mkdir -p ${qpath}"
+ 			if [ -n "${mode}" ]; then
+ 				cmd="${cmd} && chmod ${mode} ${qpath}"
+ 			fi
+ 			if [ -n "${owner}" ] && [ -n "${group}" ]; then
+-				cmd="${cmd} && chown ${owner}:${group} ${qpath}"
++				qowner=$(quote_sh "${owner}")
++				qgroup=$(quote_sh "${group}")
++				cmd="${cmd} && chown ${qowner}:${qgroup} ${qpath}"
+ 			elif [ -n "${owner}" ]; then
+-				cmd="${cmd} && chown ${owner} ${qpath}"
++				qowner=$(quote_sh "${owner}")
++				cmd="${cmd} && chown ${qowner} ${qpath}"
+ 			elif [ -n "${group}" ]; then
+-				cmd="${cmd} && chgrp ${group} ${qpath}"
++				qgroup=$(quote_sh "${group}")
++				cmd="${cmd} && chgrp ${qgroup} ${qpath}"
+ 			fi
+ 			apply_exec_in_cell "${cell_cid}" "${cmd}" || return 1
+ 			;;
+@@ -3539,6 +3643,12 @@ apply_declarative_plan() {
+ 					;;
+ 				esac
+ 			done
++			if [ -n "${owner}" ]; then
++				owner=$(resolve_apply_owner_spec "${owner}" "${plan_file}:${line_no}") || return 1
++			fi
++			if [ -n "${group}" ]; then
++				group=$(resolve_apply_group_spec "${group}" "${plan_file}:${line_no}") || return 1
++			fi
+ 			apply_copy_host_file "${cell_cid}" "${plan_file}" "${source_path}" \
+ 			    "${target_path}" "${mode}" "${owner}" "${group}" || return 1
+ 			;;
+@@ -3663,6 +3773,12 @@ apply_declarative_plan() {
+ 				return 1
+ 				;;
+ 			esac
++			if [ -n "${block_owner}" ]; then
++				block_owner=$(resolve_apply_owner_spec "${block_owner}" "${plan_file}:${line_no}") || return 1
++			fi
++			if [ -n "${block_group}" ]; then
++				block_group=$(resolve_apply_group_spec "${block_group}" "${plan_file}:${line_no}") || return 1
++			fi
+ 			block_tmp_file=$(mktemp /tmp/cellmgr-apply-block.XXXXXX)
+ 			block_active=YES
+ 			block_kind=FILE
+@@ -3743,6 +3859,9 @@ apply_cell_script() {
+ 	fi
+ 
+ 	load_cell_conf "${name}"
++	APPLY_RUN_UID=${CELL_SUPERVISE_RUN_UID:-}
++	APPLY_RUN_GID=${CELL_SUPERVISE_RUN_GID:-}
++	APPLY_RUN_GROUPS=${CELL_SUPERVISE_RUN_GROUPS:-}
+ 	cell_paths "${name}"
+ 
+ 	started_by_apply=NO
+@@ -5554,7 +5673,9 @@ reconcile_one_cell() {
+ 	apply_needed=NO
+ 	apply_hash=
+ 	if [ -r "${MANIFEST_APPLY_FILE}" ]; then
+-		apply_hash=$(apply_plan_hash "${MANIFEST_APPLY_FILE}" || true)
++		apply_hash=$(apply_plan_hash "${MANIFEST_APPLY_FILE}" \
++		    "${manifest_supervise_run_uid}" "${manifest_supervise_run_gid}" \
++		    "${manifest_supervise_run_groups}" || true)
+ 		if [ -z "${apply_hash}" ]; then
+ 			apply_hash=$(file_hash "${MANIFEST_APPLY_FILE}")
+ 		fi
+diff --git a/usr.sbin/cellmgr/cellmgr.8 b/usr.sbin/cellmgr/cellmgr.8
+index dbe1e2a31e30..c5179064564f 100644
+--- a/usr.sbin/cellmgr/cellmgr.8
++++ b/usr.sbin/cellmgr/cellmgr.8
+@@ -1,5 +1,5 @@
+ ." $NetBSD$
+-.Dd March 13, 2026
++.Dd April 20, 2026
+ .Dt CELLMGR 8
+ .Os
+ .Sh NAME
+@@ -277,6 +277,31 @@ and
+ .Va CELL_SUPERVISE_RUN_GROUPS
+ as derived fields.
+ .Pp
++Apply plans can reference those resolved values with ownership placeholders:
++.Ql @run_uid
++for
++.Cm owner=
++and
++.Ql @run_gid
++for
++.Cm group=
++in
++.Cm DIR ,
++.Cm COPY ,
++and
++.Cm FILE_BEGIN
++directives.
++For
++.Cm EXEC
++directives,
++.Cm cellmgr
++exports
++.Va CELLMGR_RUN_UID ,
++.Va CELLMGR_RUN_GID ,
++and
++.Va CELLMGR_RUN_GROUPS
++inside the target cell shell.
++.Pp
+ Cell and volume names follow
+ .Dq [A-Za-z0-9._-] .
+ .Pp
+@@ -489,13 +514,13 @@ Supported directives are:
+ Install package(s) when missing.
+ .It Cm EXEC Ar command
+ Run a shell command inside the cell.
+-.It Cm DIR Ar path Op Cm mode=0755 Op Cm owner=user Op Cm group=group
++.It Cm DIR Ar path Op Cm mode=0755 Op Cm owner=user|@run_uid Op Cm group=group|@run_gid
+ Create a directory and optionally set metadata.
+ .It Cm LINE Ar path | text
+ Append a line when it is not already present.
+ .It Cm SYMLINK Ar target Ar linkpath
+ Create or update a symbolic link.
+-.It Cm COPY Ar host-source Ar target Op Cm mode=0644 Op Cm owner=user Op Cm group=group
++.It Cm COPY Ar host-source Ar target Op Cm mode=0644 Op Cm owner=user|@run_uid Op Cm group=group|@run_gid
+ Copy one regular file from host into the cell.
+ .Ar host-source
+ may be absolute or relative to the directory that contains the apply plan.
+@@ -504,7 +529,7 @@ Extract one host tar.gz archive inside the cell at
+ .Ar target-dir .
+ .Ar target-dir
+ must be an absolute path.
+-.It Cm FILE_BEGIN Ar path Op Cm mode=0644 Op Cm owner=user Op Cm group=group
++.It Cm FILE_BEGIN Ar path Op Cm mode=0644 Op Cm owner=user|@run_uid Op Cm group=group|@run_gid
+ Start an inline file content block.
+ Terminate with
+ .Cm FILE_END .
+@@ -513,6 +538,28 @@ Start an inline unified diff block.
+ Terminate with
+ .Cm PATCH_END .
+ .El
++The placeholders
++.Ql @run_uid
++and
++.Ql @run_gid
++require resolved runtime run-as values.
++If
++.Va CELL_SUPERVISE_RUN_AS
++is unset
++.Pq or has not been rendered yet ,
++directives that use those placeholders fail.
++For
++.Cm EXEC
++directives,
++.Cm cellmgr
++exports
++.Va CELLMGR_RUN_UID ,
++.Va CELLMGR_RUN_GID ,
++and
++.Va CELLMGR_RUN_GROUPS .
++When apply plans reference these placeholders or variables, run-identity values
++contribute to apply hashing so run-as changes trigger apply without
++.Cm --reapply .
+ For
+ .Cm COPY
+ and
+diff --git a/usr.sbin/cellmgr/examples/README b/usr.sbin/cellmgr/examples/README
+index a71fb6f8a840..52fccf578bfd 100644
+--- a/usr.sbin/cellmgr/examples/README
++++ b/usr.sbin/cellmgr/examples/README
+@@ -132,16 +132,23 @@ Copy example manifests into `/etc/cellmgr` and run:
+ 
+ - `PKG <package>`
+ - `EXEC <command>`
+-- `DIR <path> [mode=0755] [owner=user] [group=group]`
++- `DIR <path> [mode=0755] [owner=user|@run_uid] [group=group|@run_gid]`
+ - `LINE <path> | <text>`
+ - `SYMLINK <target> <linkpath>`
+-- `COPY <host-source> <target> [mode=0644] [owner=user] [group=group]`
++- `COPY <host-source> <target> [mode=0644] [owner=user|@run_uid] [group=group|@run_gid]`
+ - `UNTAR <host-archive.tar.gz> <target-dir> [strip=0]`
+-- `FILE_BEGIN <path> [mode=0644] [owner=user] [group=group]`
++- `FILE_BEGIN <path> [mode=0644] [owner=user|@run_uid] [group=group|@run_gid]`
+ - `FILE_END`
+ - `PATCH_BEGIN <path> [strip=0]`
+ - `PATCH_END`
+ 
++`DIR`, `COPY`, and `FILE_BEGIN` accept `owner=@run_uid` and
++`group=@run_gid` placeholders. These resolve from
++`CELL_SUPERVISE_RUN_AS` into rendered runtime `CELL_SUPERVISE_RUN_UID/GID`.
++
++`EXEC` directives run with `CELLMGR_RUN_UID`, `CELLMGR_RUN_GID`, and
++`CELLMGR_RUN_GROUPS` exported in the cell shell.
++
+ Before executing each plan, `cellmgr` runs `certctl rehash` inside the target
+ cell and exports `PKG_PATH` for package operations.
+ For `COPY` and `UNTAR`, host source paths may be absolute or relative to the
+diff --git a/usr.sbin/cellmgr/examples/manifest.apply.sample b/usr.sbin/cellmgr/examples/manifest.apply.sample
+index 03506c4f1a88..ebdb7ec3d31c 100644
+--- a/usr.sbin/cellmgr/examples/manifest.apply.sample
++++ b/usr.sbin/cellmgr/examples/manifest.apply.sample
+@@ -2,8 +2,12 @@
+ 
+ PKG nginx
+ DIR /var/www/example mode=0755
++# If CELL_SUPERVISE_RUN_AS is configured, owner/group can track resolved
++# runtime identity via owner=@run_uid and group=@run_gid.
++# DIR /var/www/example mode=0755 owner=@run_uid group=@run_gid
+ # COPY ./assets/favicon.ico /var/www/example/favicon.ico mode=0644
+ # UNTAR ./assets/site-content.tar.gz /var/www/example strip=1
++# EXEC receives CELLMGR_RUN_UID, CELLMGR_RUN_GID, CELLMGR_RUN_GROUPS.
+ EXEC [ -f /var/www/example/.bootstrapped ] || touch /var/www/example/.bootstrapped
+ FILE_BEGIN /var/www/example/index.html mode=0644
+ <!doctype html>
+diff --git a/usr.sbin/cellmgr/examples/manifest.cell.sample b/usr.sbin/cellmgr/examples/manifest.cell.sample
+index 22d100aeae21..cf26f4a0212e 100644
+--- a/usr.sbin/cellmgr/examples/manifest.cell.sample
++++ b/usr.sbin/cellmgr/examples/manifest.cell.sample
+@@ -19,6 +19,11 @@ CELL_SUPERVISE_TAG="cell-example"
+ # Required: one service command per cell
+ CELL_SUPERVISE_CMD="/usr/libexec/httpd -I 8080 -X -s -f /var/www/example"
+ 
++# Optional supervised run identity contract. During apply, cellmgr resolves
++# this into numeric CELL_SUPERVISE_RUN_UID/GID/GROUPS in runtime cell.conf.
++# Example: CELL_SUPERVISE_RUN_AS="host:www:www"
++CELL_SUPERVISE_RUN_AS=""
++
+ # Optional dependency graph and health probe
+ CELL_DEPENDS_ON=""
+ CELL_HEALTHCHECK_CMD="test -f /var/www/example/index.html"
+-- 
+2.47.3
+
