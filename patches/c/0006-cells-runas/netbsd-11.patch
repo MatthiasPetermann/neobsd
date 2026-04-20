@@ -1,0 +1,1382 @@
+From 065bc234bd8ae110d66ef1cc0e2dd5a05320ded0 Mon Sep 17 00:00:00 2001
+From: Matthias Petermann <mp@petermann-it.de>
+Date: Mon, 20 Apr 2026 06:59:43 +0200
+Subject: [PATCH] cellmgr/cellctl: add declarative run-as for supervised
+ services
+
+Supervised workloads previously defaulted to root, which is unsafe and can
+cause ownership inconsistencies when isolated services write to shared storage.
+This change introduces an explicit runtime identity contract for supervised
+commands and applies it end-to-end.
+
+- add cellmgr --run-as / CELL_SUPERVISE_RUN_AS
+  (host:user[:group] or uid:uid[:gid])
+- resolve run-as identities to numeric credentials during apply
+- render runtime-only CELL_SUPERVISE_RUN_UID/GID/GROUPS into cell.conf
+- treat both run-as intent and resolved credentials as service drift
+- extend cellctl supervise with -U/-G/-g and drop credentials in strict order
+  after chroot and cell enter: setgroups -> setgid -> setuid
+- fail closed when run-as is configured but runtime credentials are missing
+- update docs/manpages and expose run-as in cell output fields
+
+This makes supervised startup deterministic, enforces least privilege by
+default, and keeps file ownership behavior consistent across host/cell
+boundaries without coupling identity handling to mount-specific logic.
+---
+ doc/specs/netbsd-cells-specification.txt      |   9 +
+ usr.sbin/cellctl/cellctl.8                    |  36 +-
+ usr.sbin/cellctl/cellctl.c                    | 159 ++++++-
+ usr.sbin/cellmgr/cellmgr                      | 425 +++++++++++++++++-
+ usr.sbin/cellmgr/cellmgr.8                    |  32 ++
+ usr.sbin/cellmgr/examples/cellmgr.conf.sample |   2 +
+ usr.sbin/cellmgr/lib/cell.sh                  |  29 +-
+ usr.sbin/cellmgr/lib/common.sh                |  12 +-
+ 8 files changed, 662 insertions(+), 42 deletions(-)
+
+diff --git a/doc/specs/netbsd-cells-specification.txt b/doc/specs/netbsd-cells-specification.txt
+index 5c3b0fa3be36..d20738114ad1 100644
+--- a/doc/specs/netbsd-cells-specification.txt
++++ b/doc/specs/netbsd-cells-specification.txt
+@@ -123,10 +123,16 @@ Cell manifest (`<name>.cell`) keys:
+ - `CELL_SUPERVISE_STDERR_LEVEL`
+ - `CELL_SUPERVISE_TAG`
+ - `CELL_SUPERVISE_CMD` (required)
++- `CELL_SUPERVISE_RUN_AS` (`host:user[:group]` or `uid:uid[:gid]`)
+ - `CELL_DEPENDS_ON` (comma-separated cell names)
+ - `CELL_HEALTHCHECK_CMD`
+ - `CELL_VOLUME_MOUNTS` (`<volume>:<target>[:ro|rw]`, normalized to explicit mode)
+ 
++Runtime-only derived `cell.conf` keys (written by `cellmgr apply`):
++- `CELL_SUPERVISE_RUN_UID`
++- `CELL_SUPERVISE_RUN_GID`
++- `CELL_SUPERVISE_RUN_GROUPS` (comma-separated gids)
++
+ Apply plan (`<name>.apply`) directives:
+ - `PKG <package>...`
+ - `EXEC <command>`
+@@ -174,6 +180,7 @@ Merged row superset (stable field names):
+ - `depends_on`
+ - `healthcheck`
+ - `supervise_cmd`
++- `supervise_run_as`
+ - `volume_mounts`
+ - `manifest`
+ - `rendered`
+@@ -243,6 +250,8 @@ Cell reconcile behavior summary:
+ - create/update runtime `cell.conf` when manifest drift exists
+ - enforce autostart intent (`start`/`stop`)
+ - restart service when supervise config changed
++- resolve `CELL_SUPERVISE_RUN_AS` to runtime numeric uid/gid/groups and render
++  resolved values into runtime `cell.conf`; treat resolved drift as service drift
+ - policy-only drift (`profile/ports/rlimits`):
+   - warning by default
+   - restart only with `--restart-changed`
+diff --git a/usr.sbin/cellctl/cellctl.8 b/usr.sbin/cellctl/cellctl.8
+index ace345f908bd..37c3edb977a0 100644
+--- a/usr.sbin/cellctl/cellctl.8
++++ b/usr.sbin/cellctl/cellctl.8
+@@ -47,6 +47,9 @@
+ .Op Fl o Ar stdout-level
+ .Op Fl e Ar stderr-level
+ .Op Fl t Ar tag
++.Op Fl U Ar uid
++.Op Fl G Ar gid
++.Op Fl g Ar gid[,gid...]
+ .Ar cell-id | name
+ .Ar command
+ .Op Ar args ...
+@@ -129,7 +132,7 @@ for supervised processes in this cell.
+ .Pp
+ If these rlimit flags are omitted, supervised commands keep the host default
+ limit behavior.
+-.It Cm supervise Op Fl f Ar facility Op Fl o Ar stdout-level Op Fl e Ar stderr-level Op Fl t Ar tag Ar cell-id | name Ar command Op Ar args ...
++.It Cm supervise Op Fl f Ar facility Op Fl o Ar stdout-level Op Fl e Ar stderr-level Op Fl t Ar tag Op Fl U Ar uid Op Fl G Ar gid Op Fl g Ar gid[,gid...] Ar cell-id | name Ar command Op Ar args ...
+ Start a command in an existing cell selected by
+ .Ar cell-id
+ or
+@@ -182,8 +185,39 @@ Set the syslog tag used for forwarded celled-command output.
+ If omitted,
+ .Dq cellctl
+ is used.
++.It Fl U Ar uid
++Drop supervised child credentials to this numeric user id after
++.Xr chroot 2
++and
++the cell membership switch has completed.
++.It Fl G Ar gid
++Drop supervised child credentials to this numeric primary group id.
++When
++.Fl U
++is used,
++.Fl G
++is required, and vice versa.
++.It Fl g Ar gid[,gid...]
++Set supplementary groups for supervised children.
++This option requires
++.Fl U
++and
++.Fl G .
++When omitted while
++.Fl U
++and
++.Fl G
++are provided, supplementary groups are cleared.
+ .El
+ .Pp
++When credential drop options are configured, the supervisor applies them in
++the order
++.Xr setgroups 2 ,
++.Xr setgid 2 ,
++then
++.Xr setuid 2
++after entering the cell root and kernel cell membership.
++.Pp
+ The background supervisor process is shown in process listings as
+ .Dq cellctl supervise cell=<name> cid=<id>
+ to distinguish it from one-shot supervise invocations.
+diff --git a/usr.sbin/cellctl/cellctl.c b/usr.sbin/cellctl/cellctl.c
+index d3dfa27df58a..378c571e257a 100644
+--- a/usr.sbin/cellctl/cellctl.c
++++ b/usr.sbin/cellctl/cellctl.c
+@@ -44,7 +44,9 @@ __RCSID("$NetBSD$");
+ #include <errno.h>
+ #include <ctype.h>
+ #include <fcntl.h>
++#include <grp.h>
+ #include <inttypes.h>
++#include <limits.h>
+ #include <paths.h>
+ #include <poll.h>
+ #include <signal.h>
+@@ -59,21 +61,35 @@ __RCSID("$NetBSD$");
+ #define CELLCTL_LOG_MAX 511
+ #define CELLCTL_TAG_MAX 63
+ 
++struct supervise_creds {
++  bool enabled;
++  uid_t uid;
++  gid_t gid;
++  gid_t *groups;
++  size_t ngroups;
++};
++
+ static void usage(void) __dead;
+ 
+-static void cell_exec(cellid_t, const char *, char *[]);
++static void cell_exec(cellid_t, const char *, char *[],
++                      const struct supervise_creds *);
+ static void cell_run_monitor_once(cellid_t, const char *, int, int, pid_t, int,
+                                   int, int *);
+ static void cell_supervise_loop(const struct cell_info *, const char *, char *[],
+-                                int, int, int);
++                                int, int, int,
++                                const struct supervise_creds *);
+ static void cell_spawn_detached(const struct cell_info *, const char *, char *[],
+-                                int, int, int);
++                                int, int, int,
++                                const struct supervise_creds *);
+ static int parse_log_facility(const char *);
+ static int parse_log_level(const char *);
+ static int parse_log_level_arg(const char *);
+ static void validate_cell_name_or_die(const char *);
+ static uint32_t parse_profile(const char *);
+ static void parse_port_list(struct cell_create *, const char *);
++static uid_t parse_uid_arg(const char *);
++static gid_t parse_gid_arg(const char *, const char *);
++static void parse_gid_list(const char *, gid_t **, size_t *);
+ static bool parse_rlimit_value(const char *, uint64_t *);
+ static void parse_create_rlimit(struct cell_create *, uint32_t, uint64_t *,
+                                 const char *, const char *);
+@@ -587,7 +603,8 @@ static bool cell_lookup_by_name(const char *name, struct cell_info *jip) {
+   return false;
+ }
+ 
+-static void cell_exec(cellid_t id, const char *root, char *cmd[]) {
++static void cell_exec(cellid_t id, const char *root, char *cmd[],
++                      const struct supervise_creds *creds) {
+   const char *shell;
+ 
+   /*
+@@ -604,6 +621,17 @@ static void cell_exec(cellid_t id, const char *root, char *cmd[]) {
+ 
+   cell_enter(id);
+ 
++  if (creds != NULL && creds->enabled) {
++    if (creds->ngroups > (size_t)INT_MAX)
++      errx(1, "too many supplementary gids");
++    if (setgroups((int)creds->ngroups, creds->groups) == -1)
++      err(1, "setgroups");
++    if (setgid(creds->gid) == -1)
++      err(1, "setgid");
++    if (setuid(creds->uid) == -1)
++      err(1, "setuid");
++  }
++
+   if (cmd != NULL) {
+     execvp(cmd[0], cmd);
+     err(1, "%s", cmd[0]);
+@@ -809,7 +837,8 @@ static void cell_run_monitor_once(cellid_t id, const char *name, int outfd,
+ 
+ static void cell_supervise_loop(const struct cell_info *entry,
+                                 const char *logtag, char *cmd[], int facility,
+-                                int stdout_priority, int stderr_priority) {
++                                int stdout_priority, int stderr_priority,
++                                const struct supervise_creds *creds) {
+   struct sigaction sa;
+   int next_backoff_sec;
+   cellid_t id;
+@@ -881,14 +910,21 @@ static void cell_supervise_loop(const struct cell_info *entry,
+       close(outpipe[1]);
+       close(errpipe[1]);
+       apply_supervise_rlimits_or_die(entry);
+-      cell_exec(id, root, cmd);
++      cell_exec(id, root, cmd, creds);
+     }
+ 
+     close(outpipe[1]);
+     close(errpipe[1]);
+ 
+-    syslog(LOG_INFO, "cell=%s cid=%" PRIu32 " starting supervised command",
+-           name, id);
++    if (creds != NULL && creds->enabled) {
++      syslog(LOG_INFO,
++             "cell=%s cid=%" PRIu32
++             " starting supervised command as uid=%ju gid=%ju",
++             name, id, (uintmax_t)creds->uid, (uintmax_t)creds->gid);
++    } else {
++      syslog(LOG_INFO, "cell=%s cid=%" PRIu32 " starting supervised command",
++             name, id);
++    }
+     status = 0;
+     cell_run_monitor_once(id, name, outpipe[0], errpipe[0], child,
+                           stdout_priority, stderr_priority, &status);
+@@ -955,8 +991,10 @@ static void cell_supervise_loop(const struct cell_info *entry,
+ 
+ static void cell_spawn_detached(const struct cell_info *entry,
+                                 const char *logtag, char *cmd[], int facility,
+-                                int stdout_priority, int stderr_priority) {
++                                int stdout_priority, int stderr_priority,
++                                const struct supervise_creds *creds) {
+   struct cell_info entry_copy;
++  struct supervise_creds creds_copy;
+   int devnull;
+   pid_t mgr;
+   cellid_t id;
+@@ -964,6 +1002,9 @@ static void cell_spawn_detached(const struct cell_info *entry,
+   if (entry == NULL)
+     errx(1, "internal error: missing cell entry");
+   entry_copy = *entry;
++  memset(&creds_copy, 0, sizeof(creds_copy));
++  if (creds != NULL)
++    creds_copy = *creds;
+   id = entry_copy.ci_id;
+ 
+   /*
+@@ -992,7 +1033,7 @@ static void cell_spawn_detached(const struct cell_info *entry,
+     if (devnull > STDERR_FILENO)
+       close(devnull);
+     cell_supervise_loop(&entry_copy, logtag, cmd, facility, stdout_priority,
+-                        stderr_priority);
++                        stderr_priority, &creds_copy);
+   }
+   printf("cell %" PRIu32 "\n", id);
+ }
+@@ -1125,6 +1166,72 @@ static int getnum(const char *str, uintmax_t *num) {
+   return 0;
+ }
+ 
++static uid_t parse_uid_arg(const char *arg) {
++  uintmax_t num;
++
++  if (getnum(arg, &num) == -1 || (uid_t)num != num)
++    errx(1, "invalid uid: %s", arg);
++
++  return (uid_t)num;
++}
++
++static gid_t parse_gid_arg(const char *arg, const char *what) {
++  uintmax_t num;
++
++  if (getnum(arg, &num) == -1 || (gid_t)num != num)
++    errx(1, "invalid %s: %s", what, arg);
++
++  return (gid_t)num;
++}
++
++static void parse_gid_list(const char *arg, gid_t **groups, size_t *ngroups) {
++  char *list, *tok, *sp;
++  gid_t *parsed;
++  size_t n;
++
++  if (arg == NULL || arg[0] == '\0')
++    errx(1, "invalid supplementary gid list");
++
++  list = strdup(arg);
++  if (list == NULL)
++    err(1, "strdup");
++
++  parsed = *groups;
++  n = *ngroups;
++  for (tok = strtok_r(list, ",", &sp); tok != NULL;
++       tok = strtok_r(NULL, ",", &sp)) {
++    gid_t gid;
++    gid_t *tmp;
++
++    if (tok[0] == '\0') {
++      free(list);
++      errx(1, "invalid supplementary gid list: %s", arg);
++    }
++
++    gid = parse_gid_arg(tok, "supplementary gid");
++    if (n >= (size_t)INT_MAX) {
++      free(list);
++      free(parsed);
++      errx(1, "too many supplementary gids (max %d)", INT_MAX);
++    }
++    tmp = realloc(parsed, (n + 1) * sizeof(*tmp));
++    if (tmp == NULL) {
++      free(list);
++      free(parsed);
++      err(1, "realloc");
++    }
++    parsed = tmp;
++    parsed[n++] = gid;
++  }
++
++  free(list);
++  if (n == *ngroups)
++    errx(1, "invalid supplementary gid list: %s", arg);
++
++  *groups = parsed;
++  *ngroups = n;
++}
++
+ static void validate_cell_name_or_die(const char *name) {
+   size_t i;
+ 
+@@ -1227,13 +1334,18 @@ int main(int argc, char *argv[]) {
+     int ch;
+     int facility, stdout_level, stderr_level;
+     char logtag[CELLCTL_TAG_MAX + 1];
++    struct supervise_creds creds;
++    bool have_uid, have_gid;
+ 
+     facility = LOG_DAEMON;
+     stdout_level = LOG_NOTICE;
+     stderr_level = LOG_ERR;
+     strlcpy(logtag, "cellctl", sizeof(logtag));
++    memset(&creds, 0, sizeof(creds));
++    have_uid = false;
++    have_gid = false;
+     optind = 2;
+-    while ((ch = getopt(argc, argv, "f:t:o:e:")) != -1) {
++    while ((ch = getopt(argc, argv, "f:t:o:e:U:G:g:")) != -1) {
+       switch (ch) {
+       case 'f':
+         facility = parse_log_facility(optarg);
+@@ -1249,11 +1361,28 @@ int main(int argc, char *argv[]) {
+         if (logtag[0] == '\0')
+           errx(1, "invalid log tag");
+         break;
++      case 'U':
++        creds.uid = parse_uid_arg(optarg);
++        have_uid = true;
++        break;
++      case 'G':
++        creds.gid = parse_gid_arg(optarg, "gid");
++        have_gid = true;
++        break;
++      case 'g':
++        parse_gid_list(optarg, &creds.groups, &creds.ngroups);
++        break;
+       default:
+         usage();
+       }
+     }
+ 
++    if (have_uid != have_gid)
++      errx(1, "-U and -G must be specified together");
++    if (creds.ngroups > 0 && !have_uid)
++      errx(1, "-g requires -U and -G");
++    creds.enabled = have_uid;
++
+     if (optind >= argc)
+       usage();
+ 
+@@ -1263,7 +1392,8 @@ int main(int argc, char *argv[]) {
+     cmd = &argv[optind];
+ 
+     cell_spawn_detached(&ji, logtag, cmd, facility,
+-                        facility | stdout_level, facility | stderr_level);
++                        facility | stdout_level, facility | stderr_level,
++                        creds.enabled ? &creds : NULL);
+     return 0;
+   }
+ 
+@@ -1282,7 +1412,7 @@ int main(int argc, char *argv[]) {
+ 
+     id = resolve_cell_target(argv[2], &ji);
+ 
+-    cell_exec(id, ji.ci_root, argc > 3 ? &argv[3] : NULL);
++    cell_exec(id, ji.ci_root, argc > 3 ? &argv[3] : NULL, NULL);
+     /* NOTREACHED */
+   }
+ 
+@@ -1372,7 +1502,8 @@ static void usage(void) {
+           "[-N nofile|unlimited] [-A as|unlimited] "
+           "[-C core|unlimited] -n name <root>\n"
+           "       %s supervise [-f facility] [-o stdout-level] "
+-          "[-e stderr-level] [-t tag] <cell-id|name> <command [args...]>\n"
++          "[-e stderr-level] [-t tag] [-U uid -G gid [-g gid[,gid...]]] "
++          "<cell-id|name> <command [args...]>\n"
+           "       %s exec <cell-id|name> [command [args...]]\n"
+           "       %s destroy <cell-id|name>\n"
+           "       %s list [-T] [-H]\n"
+diff --git a/usr.sbin/cellmgr/cellmgr b/usr.sbin/cellmgr/cellmgr
+index 486006cadc34..99634ef1ce90 100755
+--- a/usr.sbin/cellmgr/cellmgr
++++ b/usr.sbin/cellmgr/cellmgr
+@@ -271,12 +271,13 @@ Cell commands:
+       [--rlimit-nofile n|unlimited] [--rlimit-as bytes|unlimited]
+       [--rlimit-core bytes|unlimited]
+       [--depends-on deps] [--healthcheck cmd] [--mount spec]
++      [--run-as host:user[:group]|uid:uid[:gid]]
+       [--log-facility fac] [--stdout-level lvl] [--stderr-level lvl]
+       [--log-tag tag] [--scope desired|both]
+   cell set <name> [same options as create] [--clear-reserved-ports]
+       [--clear-rlimit-nofile] [--clear-rlimit-as] [--clear-rlimit-core]
+       [--clear-depends-on] [--clear-healthcheck] [--clear-mounts]
+-      [--clear-log] [--scope desired|both]
++      [--clear-log] [--clear-run-as] [--scope desired|both]
+   cell remove <name|--all|--orphans> [--scope desired|runtime|both] [--yes] [--force]
+   cell start <name|--all> [--scope runtime|both]
+   cell stop <name|--all> [--scope runtime|both]
+@@ -318,6 +319,7 @@ Notes:
+   - With -T, output is stable TSV and includes a header unless -H is set.
+   - --mount accepts <volume|/host/path>:/target[:ro|rw].
+     Host paths require CELL_ALLOW_HOST_MOUNTS=YES.
++  - --run-as accepts host:user[:group] or uid:uid[:gid].
+   - Destructive --all/--orphans operations require --yes when non-interactive.
+ 
+ Paths:
+@@ -420,6 +422,267 @@ normalize_volume_mount_list() {
+ 	printf '%s' "${1:-}" | tr ',' ' '
+ }
+ 
++validate_gid_csv() {
++	gid_csv=$1
++	gid_origin=$2
++	[ -n "${gid_csv}" ] || return 0
++	if ! printf '%s\n' "${gid_csv}" | awk -F',' '
++		{
++			if (NF < 1)
++				exit 1
++			for (i = 1; i <= NF; i++) {
++				if ($i !~ /^[0-9]+$/)
++					exit 1
++			}
++		}
++	'; then
++		echo "${gid_origin}: invalid gid list '${gid_csv}'" >&2
++		return 1
++	fi
++	return 0
++}
++
++validate_cell_supervise_run_as() {
++	run_as_spec=${1:-}
++	run_as_origin=${2:-run-as}
++	CELL_SUPERVISE_RUN_AS_NORMALIZED=
++
++	[ -n "${run_as_spec}" ] || return 0
++
++	case "${run_as_spec}" in
++	uid:*)
++		run_as_body=${run_as_spec#uid:}
++		set -f
++		run_as_old_ifs=${IFS}
++		IFS=:
++		set -- ${run_as_body}
++		IFS=${run_as_old_ifs}
++		set +f
++
++		if [ $# -eq 1 ]; then
++			run_as_uid=$1
++			run_as_gid=
++		elif [ $# -eq 2 ]; then
++			run_as_uid=$1
++			run_as_gid=$2
++		else
++			echo "${run_as_origin}: invalid --run-as '${run_as_spec}' (expected uid:uid[:gid])" >&2
++			return 1
++		fi
++
++		case "${run_as_uid}" in
++		""|*[!0-9]*)
++			echo "${run_as_origin}: invalid uid in --run-as '${run_as_spec}'" >&2
++			return 1
++			;;
++		esac
++		case "${run_as_gid}" in
++		"" )
++			CELL_SUPERVISE_RUN_AS_NORMALIZED="uid:${run_as_uid}"
++			return 0
++			;;
++		*[!0-9]*)
++			echo "${run_as_origin}: invalid gid in --run-as '${run_as_spec}'" >&2
++			return 1
++			;;
++		esac
++		CELL_SUPERVISE_RUN_AS_NORMALIZED="uid:${run_as_uid}:${run_as_gid}"
++		return 0
++		;;
++	host:*)
++		run_as_body=${run_as_spec#host:}
++		set -f
++		run_as_old_ifs=${IFS}
++		IFS=:
++		set -- ${run_as_body}
++		IFS=${run_as_old_ifs}
++		set +f
++
++		if [ $# -eq 1 ]; then
++			run_as_user=$1
++			run_as_group=
++		elif [ $# -eq 2 ]; then
++			run_as_user=$1
++			run_as_group=$2
++		else
++			echo "${run_as_origin}: invalid --run-as '${run_as_spec}' (expected host:user[:group])" >&2
++			return 1
++		fi
++
++		case "${run_as_user}" in
++		""|*[!A-Za-z0-9._-]*)
++			echo "${run_as_origin}: invalid user in --run-as '${run_as_spec}'" >&2
++			return 1
++			;;
++		esac
++		case "${run_as_group}" in
++		"" )
++			CELL_SUPERVISE_RUN_AS_NORMALIZED="host:${run_as_user}"
++			return 0
++			;;
++		*[!A-Za-z0-9._-]*)
++			echo "${run_as_origin}: invalid group in --run-as '${run_as_spec}'" >&2
++			return 1
++			;;
++		esac
++		CELL_SUPERVISE_RUN_AS_NORMALIZED="host:${run_as_user}:${run_as_group}"
++		return 0
++		;;
++	*)
++		echo "${run_as_origin}: invalid --run-as '${run_as_spec}' (expected host:user[:group] or uid:uid[:gid])" >&2
++		return 1
++		;;
++	esac
++}
++
++resolve_host_group_gid() {
++	run_as_group=$1
++	case "${run_as_group}" in
++	"" )
++		echo "resolve group gid: empty group" >&2
++		return 1
++		;;
++	*[!0-9]*)
++		run_as_gid=
++		if command -v getent >/dev/null 2>&1; then
++			run_as_gid=$(getent group "${run_as_group}" 2>/dev/null |
++			    awk -F: 'NR == 1 { print $3; exit }')
++		fi
++		if [ -z "${run_as_gid}" ] && [ -r /etc/group ]; then
++			run_as_gid=$(awk -F: -v g="${run_as_group}" '$1 == g { print $3; exit }' /etc/group)
++		fi
++		case "${run_as_gid}" in
++		""|*[!0-9]*)
++			echo "unable to resolve group '${run_as_group}' to numeric gid" >&2
++			return 1
++			;;
++		esac
++		printf '%s\n' "${run_as_gid}"
++		return 0
++		;;
++	*)
++		printf '%s\n' "${run_as_group}"
++		return 0
++		;;
++	esac
++}
++
++resolve_cell_supervise_run_as() {
++	run_as_spec=${1:-}
++	run_as_origin=${2:-run-as}
++	RESOLVED_SUPERVISE_RUN_UID=
++	RESOLVED_SUPERVISE_RUN_GID=
++	RESOLVED_SUPERVISE_RUN_GROUPS=
++
++	[ -n "${run_as_spec}" ] || return 0
++	if ! validate_cell_supervise_run_as "${run_as_spec}" "${run_as_origin}"; then
++		return 1
++	fi
++	run_as_spec=${CELL_SUPERVISE_RUN_AS_NORMALIZED}
++
++	case "${run_as_spec}" in
++	uid:*)
++		run_as_body=${run_as_spec#uid:}
++		set -f
++		run_as_old_ifs=${IFS}
++		IFS=:
++		set -- ${run_as_body}
++		IFS=${run_as_old_ifs}
++		set +f
++		run_as_uid=$1
++		run_as_gid=${2:-}
++		if [ -z "${run_as_gid}" ]; then
++			run_as_gid=${run_as_uid}
++		fi
++		RESOLVED_SUPERVISE_RUN_UID=${run_as_uid}
++		RESOLVED_SUPERVISE_RUN_GID=${run_as_gid}
++		RESOLVED_SUPERVISE_RUN_GROUPS=
++		return 0
++		;;
++	host:*)
++		run_as_body=${run_as_spec#host:}
++		set -f
++		run_as_old_ifs=${IFS}
++		IFS=:
++		set -- ${run_as_body}
++		IFS=${run_as_old_ifs}
++		set +f
++		run_as_user=$1
++		run_as_group=${2:-}
++
++		run_as_uid=$(id -u "${run_as_user}" 2>/dev/null || true)
++		case "${run_as_uid}" in
++		""|*[!0-9]*)
++			echo "${run_as_origin}: unable to resolve user '${run_as_user}' on host" >&2
++			return 1
++			;;
++		esac
++
++		if [ -n "${run_as_group}" ]; then
++			run_as_gid=$(resolve_host_group_gid "${run_as_group}") || return 1
++		else
++			run_as_gid=$(id -g "${run_as_user}" 2>/dev/null || true)
++		fi
++		case "${run_as_gid}" in
++		""|*[!0-9]*)
++			echo "${run_as_origin}: unable to resolve gid for user '${run_as_user}'" >&2
++			return 1
++			;;
++		esac
++
++		run_as_groups=$(id -G "${run_as_user}" 2>/dev/null || true)
++		if [ -n "${run_as_groups}" ]; then
++			run_as_groups_csv=$(printf '%s\n' "${run_as_groups}" | awk '
++				{
++					for (i = 1; i <= NF; i++) {
++						if ($i !~ /^[0-9]+$/)
++							exit 1
++						if (!seen[$i]++) {
++							if (out == "")
++								out = $i
++							else
++								out = out "," $i
++						}
++					}
++				}
++				END {
++					print out
++				}
++			') || {
++				echo "${run_as_origin}: invalid supplementary groups for user '${run_as_user}'" >&2
++				return 1
++			}
++		else
++			run_as_groups_csv=
++		fi
++
++		case ",${run_as_groups_csv}," in
++		*",${run_as_gid},"*)
++			;;
++		*)
++			if [ -n "${run_as_groups_csv}" ]; then
++				run_as_groups_csv="${run_as_groups_csv},${run_as_gid}"
++			else
++				run_as_groups_csv=${run_as_gid}
++			fi
++			;;
++		esac
++
++		if ! validate_gid_csv "${run_as_groups_csv}" "${run_as_origin}"; then
++			return 1
++		fi
++
++		RESOLVED_SUPERVISE_RUN_UID=${run_as_uid}
++		RESOLVED_SUPERVISE_RUN_GID=${run_as_gid}
++		RESOLVED_SUPERVISE_RUN_GROUPS=${run_as_groups_csv}
++		return 0
++		;;
++	esac
++
++	echo "${run_as_origin}: unsupported --run-as '${run_as_spec}'" >&2
++	return 1
++}
++
+ manifest_cell_paths() {
+ 	manifest_cell_name=$1
+ 	MANIFEST_CELL_CONF="${MANIFEST_DIR}/${manifest_cell_name}.cell"
+@@ -1611,6 +1874,10 @@ load_manifest_cell_conf() {
+ 	CELL_SUPERVISE_STDOUT_LEVEL=
+ 	CELL_SUPERVISE_STDERR_LEVEL=
+ 	CELL_SUPERVISE_TAG=
++	CELL_SUPERVISE_RUN_AS=
++	CELL_SUPERVISE_RUN_UID=
++	CELL_SUPERVISE_RUN_GID=
++	CELL_SUPERVISE_RUN_GROUPS=
+ 	CELL_AUTOSTART=NO
+ 	CELL_DEPENDS_ON=
+ 	CELL_HEALTHCHECK_CMD=
+@@ -1625,9 +1892,19 @@ load_manifest_cell_conf() {
+ 		echo "manifest mismatch: expected CELL_NAME=${manifest_cell_name}, got ${CELL_NAME}" >&2
+ 		exit 1
+ 	fi
++	if [ -n "${CELL_SUPERVISE_RUN_UID:-}" ] ||
++	   [ -n "${CELL_SUPERVISE_RUN_GID:-}" ] ||
++	   [ -n "${CELL_SUPERVISE_RUN_GROUPS:-}" ]; then
++		echo "manifest ${MANIFEST_CELL_CONF}: CELL_SUPERVISE_RUN_UID/GID/GROUPS are runtime-only" >&2
++		exit 1
++	fi
+ 	manifest_name=${CELL_NAME}
+ 
+ 	CELL_AUTOSTART=$(normalize_yesno "${CELL_AUTOSTART:-NO}")
++	if ! validate_cell_supervise_run_as "${CELL_SUPERVISE_RUN_AS:-}" "manifest ${MANIFEST_CELL_CONF}"; then
++		exit 1
++	fi
++	CELL_SUPERVISE_RUN_AS=${CELL_SUPERVISE_RUN_AS_NORMALIZED}
+ 
+ 	if [ -z "${CELL_SUPERVISE_CMD:-}" ]; then
+ 		echo "manifest ${MANIFEST_CELL_CONF}: CELL_SUPERVISE_CMD is required" >&2
+@@ -1663,6 +1940,7 @@ create_manifest_cell() {
+ 	depends_on=${13:-}
+ 	healthcheck_cmd=${14:-}
+ 	volume_mounts=${15:-}
++	supervise_run_as=${16:-}
+ 
+ 	assert_valid_cell_name "${name}"
+ 	if [ -z "${supervise_cmd}" ]; then
+@@ -1680,6 +1958,10 @@ create_manifest_cell() {
+ 		exit 1
+ 	fi
+ 	volume_mounts=${CELL_VOLUME_MOUNTS_NORMALIZED}
++	if ! validate_cell_supervise_run_as "${supervise_run_as}" "create ${name}"; then
++		exit 1
++	fi
++	supervise_run_as=${CELL_SUPERVISE_RUN_AS_NORMALIZED}
+ 
+ 	ensure_manifest_layout write
+ 	manifest_cell_paths "${name}"
+@@ -1692,7 +1974,8 @@ create_manifest_cell() {
+ 	    "${create_rlimit_nofile}" "${create_rlimit_as}" "${create_rlimit_core}" \
+ 	    "${supervise_facility}" "${supervise_stdout_level}" \
+ 	    "${supervise_stderr_level}" "${supervise_tag}" \
+-	    "${depends_on}" "${healthcheck_cmd}" "${volume_mounts}"
++	    "${depends_on}" "${healthcheck_cmd}" "${volume_mounts}" \
++	    "${supervise_run_as}"
+ 
+ 	if [ -f "${MANIFEST_APPLY_FILE}" ]; then
+ 		echo "apply plan already exists: ${MANIFEST_APPLY_FILE}" >&2
+@@ -1742,6 +2025,7 @@ write_manifest_cell_conf_file() {
+ 	depends_on=${13:-}
+ 	healthcheck_cmd=${14:-}
+ 	volume_mounts=${15:-}
++	supervise_run_as=${16:-}
+ 
+ 	escaped_create_profile=$(escape_dq "${create_profile}")
+ 	escaped_create_reserved_ports=$(escape_dq "${create_reserved_ports}")
+@@ -1756,6 +2040,7 @@ write_manifest_cell_conf_file() {
+ 	escaped_depends_on=$(escape_dq "${depends_on}")
+ 	escaped_healthcheck_cmd=$(escape_dq "${healthcheck_cmd}")
+ 	escaped_volume_mounts=$(escape_dq "${volume_mounts}")
++	escaped_supervise_run_as=$(escape_dq "${supervise_run_as}")
+ 
+ 	cat > "${MANIFEST_CELL_CONF}" <<CONF
+ # declarative manifest for cellmgr apply
+@@ -1771,6 +2056,7 @@ CELL_SUPERVISE_STDOUT_LEVEL="${escaped_supervise_stdout_level}"
+ CELL_SUPERVISE_STDERR_LEVEL="${escaped_supervise_stderr_level}"
+ CELL_SUPERVISE_TAG="${escaped_supervise_tag}"
+ CELL_SUPERVISE_CMD="${escaped_supervise_cmd}"
++CELL_SUPERVISE_RUN_AS="${escaped_supervise_run_as}"
+ CELL_DEPENDS_ON="${escaped_depends_on}"
+ CELL_HEALTHCHECK_CMD="${escaped_healthcheck_cmd}"
+ CELL_VOLUME_MOUNTS="${escaped_volume_mounts}"
+@@ -1794,6 +2080,7 @@ set_manifest_cell() {
+ 	depends_on=${13:-}
+ 	healthcheck_cmd=${14:-}
+ 	volume_mounts=${15:-}
++	supervise_run_as=${16:-}
+ 
+ 	assert_valid_cell_name "${name}"
+ 	manifest_cell_paths "${name}"
+@@ -1816,13 +2103,18 @@ set_manifest_cell() {
+ 		exit 1
+ 	fi
+ 	volume_mounts=${CELL_VOLUME_MOUNTS_NORMALIZED}
++	if ! validate_cell_supervise_run_as "${supervise_run_as}" "set ${name}"; then
++		exit 1
++	fi
++	supervise_run_as=${CELL_SUPERVISE_RUN_AS_NORMALIZED}
+ 
+ 	write_manifest_cell_conf_file "${name}" "${autostart}" "${supervise_cmd}" \
+ 	    "${create_profile}" "${create_reserved_ports}" \
+ 	    "${create_rlimit_nofile}" "${create_rlimit_as}" "${create_rlimit_core}" \
+ 	    "${supervise_facility}" "${supervise_stdout_level}" \
+ 	    "${supervise_stderr_level}" "${supervise_tag}" \
+-	    "${depends_on}" "${healthcheck_cmd}" "${volume_mounts}"
++	    "${depends_on}" "${healthcheck_cmd}" "${volume_mounts}" \
++	    "${supervise_run_as}"
+ 	echo "Updated manifest ${MANIFEST_CELL_CONF}"
+ }
+ 
+@@ -2246,6 +2538,7 @@ load_cell_conf() {
+ 	CELL_SUPERVISE_STDOUT_LEVEL=
+ 	CELL_SUPERVISE_STDERR_LEVEL=
+ 	CELL_SUPERVISE_TAG=
++	CELL_SUPERVISE_RUN_AS=
+ 	CELL_AUTOSTART=NO
+ 	CELL_DEPENDS_ON=
+ 	CELL_HEALTHCHECK_CMD=
+@@ -2264,6 +2557,29 @@ load_cell_conf() {
+ 		exit 1
+ 	fi
+ 	CELL_VOLUME_MOUNTS=${CELL_VOLUME_MOUNTS_NORMALIZED}
++	if ! validate_cell_supervise_run_as "${CELL_SUPERVISE_RUN_AS:-}" "cell.conf ${CELL_CONF}"; then
++		exit 1
++	fi
++	CELL_SUPERVISE_RUN_AS=${CELL_SUPERVISE_RUN_AS_NORMALIZED}
++	case "${CELL_SUPERVISE_RUN_UID:-}" in
++	""|*[!0-9]*)
++		if [ -n "${CELL_SUPERVISE_RUN_UID:-}" ]; then
++			echo "cell.conf ${CELL_CONF}: invalid CELL_SUPERVISE_RUN_UID '${CELL_SUPERVISE_RUN_UID}'" >&2
++			exit 1
++		fi
++		;;
++	esac
++	case "${CELL_SUPERVISE_RUN_GID:-}" in
++	""|*[!0-9]*)
++		if [ -n "${CELL_SUPERVISE_RUN_GID:-}" ]; then
++			echo "cell.conf ${CELL_CONF}: invalid CELL_SUPERVISE_RUN_GID '${CELL_SUPERVISE_RUN_GID}'" >&2
++			exit 1
++		fi
++		;;
++	esac
++	if ! validate_gid_csv "${CELL_SUPERVISE_RUN_GROUPS:-}" "cell.conf ${CELL_CONF}"; then
++		exit 1
++	fi
+ }
+ 
+ # Build per-cell /dev view backed by tmpfs (+ optional ptyfs).  This keeps
+@@ -2477,6 +2793,10 @@ write_runtime_cell_conf() {
+ 	depends_on=${13:-}
+ 	healthcheck_cmd=${14:-}
+ 	volume_mounts=${15:-}
++	supervise_run_as=${16:-}
++	supervise_run_uid=${17:-}
++	supervise_run_gid=${18:-}
++	supervise_run_groups=${19:-}
+ 
+ 	escaped_create_profile=$(escape_dq "${create_profile}")
+ 	escaped_create_reserved_ports=$(escape_dq "${create_reserved_ports}")
+@@ -2491,6 +2811,10 @@ write_runtime_cell_conf() {
+ 	escaped_depends_on=$(escape_dq "${depends_on}")
+ 	escaped_healthcheck_cmd=$(escape_dq "${healthcheck_cmd}")
+ 	escaped_volume_mounts=$(escape_dq "${volume_mounts}")
++	escaped_supervise_run_as=$(escape_dq "${supervise_run_as}")
++	escaped_supervise_run_uid=$(escape_dq "${supervise_run_uid}")
++	escaped_supervise_run_gid=$(escape_dq "${supervise_run_gid}")
++	escaped_supervise_run_groups=$(escape_dq "${supervise_run_groups}")
+ 
+ 	cat > "${CELL_CONF}" <<CONF
+ # autogenerated by cellmgr apply
+@@ -2511,6 +2835,11 @@ CELL_SUPERVISE_STDERR_LEVEL="${escaped_supervise_stderr_level}"
+ CELL_SUPERVISE_TAG="${escaped_supervise_tag}"
+ # One supervised service command per cell:
+ CELL_SUPERVISE_CMD="${escaped_supervise_cmd}"
++# Optional supervised run identity contract:
++CELL_SUPERVISE_RUN_AS="${escaped_supervise_run_as}"
++CELL_SUPERVISE_RUN_UID="${escaped_supervise_run_uid}"
++CELL_SUPERVISE_RUN_GID="${escaped_supervise_run_gid}"
++CELL_SUPERVISE_RUN_GROUPS="${escaped_supervise_run_groups}"
+ # Declarative orchestration metadata:
+ CELL_DEPENDS_ON="${escaped_depends_on}"
+ CELL_HEALTHCHECK_CMD="${escaped_healthcheck_cmd}"
+@@ -2538,6 +2867,10 @@ create_cell() {
+ 	depends_on=${13:-}
+ 	healthcheck_cmd=${14:-}
+ 	volume_mounts=${15:-}
++	supervise_run_as=${16:-}
++	supervise_run_uid=${17:-}
++	supervise_run_gid=${18:-}
++	supervise_run_groups=${19:-}
+ 
+ 	cell_paths "${name}"
+ 	mkdir -p "${ROOT_DIR}" "${DATA_VAR_DIR}" "${DATA_TMP_DIR}" \
+@@ -2552,7 +2885,9 @@ create_cell() {
+ 	    "${supervise_facility}" "${supervise_stdout_level}" \
+ 	    "${supervise_stderr_level}" "${supervise_tag}" \
+ 	    "${depends_on}" "${healthcheck_cmd}" \
+-	    "${volume_mounts}"
++	    "${volume_mounts}" "${supervise_run_as}" \
++	    "${supervise_run_uid}" "${supervise_run_gid}" \
++	    "${supervise_run_groups}"
+ 
+ 	echo "Rendered runtime cell ${name}"
+ }
+@@ -2641,6 +2976,16 @@ start_cell_internal() {
+ 		if [ -n "${CELL_SUPERVISE_TAG:-}" ]; then
+ 			set -- "$@" -t "${CELL_SUPERVISE_TAG}"
+ 		fi
++		if [ -n "${CELL_SUPERVISE_RUN_AS:-}" ]; then
++			if [ -z "${CELL_SUPERVISE_RUN_UID:-}" ] || [ -z "${CELL_SUPERVISE_RUN_GID:-}" ]; then
++				echo "CELL_SUPERVISE_RUN_AS is set but resolved uid/gid are missing in ${CELL_CONF}; run apply" >&2
++				exit 1
++			fi
++			set -- "$@" -U "${CELL_SUPERVISE_RUN_UID}" -G "${CELL_SUPERVISE_RUN_GID}"
++			if [ -n "${CELL_SUPERVISE_RUN_GROUPS:-}" ]; then
++				set -- "$@" -g "${CELL_SUPERVISE_RUN_GROUPS}"
++			fi
++		fi
+ 		# Keep CELL_SUPERVISE_CMD as a shell command string so quoted arguments
+ 		# (e.g. su -c '...') remain intact.
+ 		set -- "$@" "${name}" /bin/sh -c "exec ${effective_supervise_cmd}"
+@@ -3539,11 +3884,12 @@ show_manifest_cell() {
+ 	printf 'volume_mounts=%s\n' "${CELL_VOLUME_MOUNTS:-}"
+ 	printf 'healthcheck=%s\n' "${CELL_HEALTHCHECK_CMD:-}"
+ 	printf 'supervise_cmd=%s\n' "${CELL_SUPERVISE_CMD:-}"
++	printf 'supervise_run_as=%s\n' "${CELL_SUPERVISE_RUN_AS:-}"
+ }
+ 
+ list_manifest_cells() {
+-	printf '%-20s %-10s %-10s %-10s %-30s\n' \
+-	    'NAME' 'DESIRED' 'RENDERED' 'RUNNING' 'SUPERVISE_CMD'
++	printf '%-20s %-10s %-10s %-10s %-20s %-30s\n' \
++	    'NAME' 'DESIRED' 'RENDERED' 'RUNNING' 'RUN_AS' 'SUPERVISE_CMD'
+ 	for cell_conf in "${MANIFEST_DIR}"/*.cell; do
+ 		[ -f "${cell_conf}" ] || continue
+ 		name=${cell_conf##*/}
+@@ -3564,9 +3910,9 @@ list_manifest_cells() {
+ 		else
+ 			running=UNKNOWN
+ 		fi
+-		printf '%-20s %-10s %-10s %-10s %-30s\n' \
++		printf '%-20s %-10s %-10s %-10s %-20s %-30s\n' \
+ 			"${name}" "${desired}" "${rendered}" "${running}" \
+-			"${CELL_SUPERVISE_CMD:-}"
++			"${CELL_SUPERVISE_RUN_AS:-}" "${CELL_SUPERVISE_CMD:-}"
+ 	done
+ }
+ 
+@@ -3619,6 +3965,7 @@ create_rlimit_core
+ depends_on
+ healthcheck
+ supervise_cmd
++supervise_run_as
+ volume_mounts
+ manifest
+ apply_present
+@@ -3636,6 +3983,7 @@ cpu10s
+ memory
+ age
+ root
++supervise_run_as
+ rendered
+ FIELDS
+ 		;;
+@@ -3665,6 +4013,7 @@ volume_mounts
+ manifest
+ rendered
+ apply_present
++supervise_run_as
+ FIELDS
+ 		;;
+ 	*)
+@@ -3677,13 +4026,13 @@ FIELDS
+ runtime_view_default_fields() {
+ 	case "${1:-merged}" in
+ 	desired)
+-		printf '%s\n' 'name,desired_state,autostart,create_profile,create_reserved_ports,create_rlimit_nofile,create_rlimit_as,create_rlimit_core,depends_on,healthcheck,volume_mounts,supervise_cmd,manifest,apply_present'
++		printf '%s\n' 'name,desired_state,autostart,create_profile,create_reserved_ports,create_rlimit_nofile,create_rlimit_as,create_rlimit_core,depends_on,healthcheck,volume_mounts,supervise_cmd,supervise_run_as,manifest,apply_present'
+ 		;;
+ 	runtime)
+-		printf '%s\n' 'name,running,cid,procs,refs,cpu1s,cpu10s,memory,age,root,rendered'
++		printf '%s\n' 'name,running,cid,procs,refs,cpu1s,cpu10s,memory,age,root,supervise_run_as,rendered'
+ 		;;
+ 	merged)
+-		printf '%s\n' 'name,running,desired_state,cid,procs,refs,cpu1s,cpu10s,memory,age,autostart,create_profile,create_reserved_ports,create_rlimit_nofile,create_rlimit_as,create_rlimit_core,root,supervise_cmd,manifest,rendered'
++		printf '%s\n' 'name,running,desired_state,cid,procs,refs,cpu1s,cpu10s,memory,age,autostart,create_profile,create_reserved_ports,create_rlimit_nofile,create_rlimit_as,create_rlimit_core,root,supervise_cmd,supervise_run_as,manifest,rendered'
+ 		;;
+ 	*)
+ 		echo "cell: invalid view '${1}' (expected merged|desired|runtime)" >&2
+@@ -3699,10 +4048,10 @@ runtime_field_allowed() {
+ 	merged:*)
+ 		return 0
+ 		;;
+-	desired:name|desired:desired_state|desired:autostart|desired:create_profile|desired:create_reserved_ports|desired:create_rlimit_nofile|desired:create_rlimit_as|desired:create_rlimit_core|desired:depends_on|desired:healthcheck|desired:supervise_cmd|desired:volume_mounts|desired:manifest|desired:apply_present)
++	desired:name|desired:desired_state|desired:autostart|desired:create_profile|desired:create_reserved_ports|desired:create_rlimit_nofile|desired:create_rlimit_as|desired:create_rlimit_core|desired:depends_on|desired:healthcheck|desired:supervise_cmd|desired:supervise_run_as|desired:volume_mounts|desired:manifest|desired:apply_present)
+ 		return 0
+ 		;;
+-	runtime:name|runtime:running|runtime:cid|runtime:refs|runtime:procs|runtime:cpu1s|runtime:cpu10s|runtime:memory|runtime:age|runtime:root|runtime:rendered)
++	runtime:name|runtime:running|runtime:cid|runtime:refs|runtime:procs|runtime:cpu1s|runtime:cpu10s|runtime:memory|runtime:age|runtime:root|runtime:supervise_run_as|runtime:rendered)
+ 		return 0
+ 		;;
+ 	*)
+@@ -3737,6 +4086,7 @@ runtime_field_index() {
+ 	manifest) printf '22\n' ;;
+ 	rendered) printf '23\n' ;;
+ 	apply_present) printf '24\n' ;;
++	supervise_run_as) printf '25\n' ;;
+ 	*)
+ 		return 1
+ 		;;
+@@ -3943,16 +4293,18 @@ runtime_collect_snapshot() {
+ 			manifest_depends=$(runtime_tsv_sanitize "${CELL_DEPENDS_ON:-}")
+ 			manifest_healthcheck=$(runtime_tsv_sanitize "${CELL_HEALTHCHECK_CMD:-}")
+ 			manifest_supervise=$(runtime_tsv_sanitize "${CELL_SUPERVISE_CMD:-}")
++			manifest_run_as=$(runtime_tsv_sanitize "${CELL_SUPERVISE_RUN_AS:-}")
+ 			manifest_mounts=$(runtime_tsv_sanitize "${CELL_VOLUME_MOUNTS:-}")
+ 			apply_present=0
+ 			if [ -f "${MANIFEST_APPLY_FILE}" ]; then
+ 				apply_present=1
+ 			fi
+-			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
++			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+ 			    "${cell_name}" "${manifest_autostart}" "${manifest_profile}" \
+ 			    "${manifest_ports}" "${manifest_rlimit_nofile}" "${manifest_rlimit_as}" \
+ 			    "${manifest_rlimit_core}" "${manifest_depends}" "${manifest_healthcheck}" \
+-			    "${manifest_supervise}" "${manifest_mounts}" "${apply_present}" \
++			    "${manifest_supervise}" "${manifest_mounts}" "${manifest_run_as}" \
++			    "${apply_present}" \
+ 			    >> "${manifest_tmp}"
+ 		done
+ 	fi
+@@ -3976,12 +4328,14 @@ runtime_collect_snapshot() {
+ 			rendered_healthcheck=$(runtime_tsv_sanitize "${CELL_HEALTHCHECK_CMD:-}")
+ 			rendered_supervise=$(runtime_tsv_sanitize "${CELL_SUPERVISE_CMD:-}")
+ 			rendered_mounts=$(runtime_tsv_sanitize "${CELL_VOLUME_MOUNTS:-}")
++			rendered_run_as=$(runtime_tsv_sanitize "${CELL_SUPERVISE_RUN_AS:-}")
+ 
+-			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
++			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+ 			    "${cell_name}" "${rendered_autostart}" "${rendered_profile}" \
+ 			    "${rendered_ports}" "${rendered_rlimit_nofile}" "${rendered_rlimit_as}" \
+ 			    "${rendered_rlimit_core}" "${rendered_depends}" "${rendered_healthcheck}" \
+-			    "${rendered_supervise}" "${rendered_mounts}" "${rendered_root}" \
++			    "${rendered_supervise}" "${rendered_mounts}" "${rendered_run_as}" \
++			    "${rendered_root}" \
+ 			    >> "${rendered_tmp}"
+ 		done
+ 	fi
+@@ -4075,7 +4429,8 @@ runtime_collect_snapshot() {
+ 			m_healthcheck[n] = $9
+ 			m_supervise[n] = $10
+ 			m_mounts[n] = $11
+-			m_apply_present[n] = $12
++			m_run_as[n] = $12
++			m_apply_present[n] = $13
+ 			names[n] = 1
+ 			next
+ 		}
+@@ -4092,7 +4447,8 @@ runtime_collect_snapshot() {
+ 			r_healthcheck[n] = $9
+ 			r_supervise[n] = $10
+ 			r_mounts[n] = $11
+-			rendered_root[n] = $12
++			r_run_as[n] = $12
++			rendered_root[n] = $13
+ 			names[n] = 1
+ 			next
+ 		}
+@@ -4172,6 +4528,10 @@ runtime_collect_snapshot() {
+ 				if (supervise_v == "")
+ 					supervise_v = r_supervise[n]
+ 
++				run_as_v = m_run_as[n]
++				if (run_as_v == "")
++					run_as_v = r_run_as[n]
++
+ 				mounts_v = m_mounts[n]
+ 				if (mounts_v == "")
+ 					mounts_v = r_mounts[n]
+@@ -4199,7 +4559,7 @@ runtime_collect_snapshot() {
+ 				    sanitize(rlimit_as_v), sanitize(rlimit_core_v), \
+ 				    sanitize(depends_v), sanitize(healthcheck_v), \
+ 				    sanitize(supervise_v), sanitize(mounts_v), manifest_v, \
+-				    rendered_v, apply_present_v
++				    rendered_v, apply_present_v, sanitize(run_as_v)
+ 			}
+ 		}
+ 	' "${manifest_tmp}" "${rendered_tmp}" "${list_tmp}" "${stats_tmp}" > "${merged_tmp}"
+@@ -5134,11 +5494,20 @@ reconcile_one_cell() {
+ 	manifest_supervise_stdout_level=${CELL_SUPERVISE_STDOUT_LEVEL:-}
+ 	manifest_supervise_stderr_level=${CELL_SUPERVISE_STDERR_LEVEL:-}
+ 	manifest_supervise_tag=${CELL_SUPERVISE_TAG:-}
++	manifest_supervise_run_as=${CELL_SUPERVISE_RUN_AS:-}
+ 	manifest_depends_on=${CELL_DEPENDS_ON:-}
+ 	manifest_healthcheck_cmd=${CELL_HEALTHCHECK_CMD:-}
+ 	manifest_volume_mounts=${CELL_VOLUME_MOUNTS:-}
+-
+ 	cell_paths "${name}"
++	if ! resolve_cell_supervise_run_as "${manifest_supervise_run_as}" "manifest ${MANIFEST_CELL_CONF}"; then
++		state_write "${STATE_DIR}/last_reconcile_result" "error:resolve-run-as"
++		emit_reconcile_result "${name}" "FAILED" "resolve-run-as"
++		return 1
++	fi
++	manifest_supervise_run_uid=${RESOLVED_SUPERVISE_RUN_UID:-}
++	manifest_supervise_run_gid=${RESOLVED_SUPERVISE_RUN_GID:-}
++	manifest_supervise_run_groups=${RESOLVED_SUPERVISE_RUN_GROUPS:-}
++
+ 	manifest_hash=$(file_hash "${MANIFEST_CELL_CONF}")
+ 	manifest_hash_file="${STATE_DIR}/manifest.sha256"
+ 	apply_hash_file="${STATE_DIR}/apply.sha256"
+@@ -5157,6 +5526,10 @@ reconcile_one_cell() {
+ 		   [ "${CELL_SUPERVISE_STDOUT_LEVEL:-}" != "${manifest_supervise_stdout_level}" ] ||
+ 		   [ "${CELL_SUPERVISE_STDERR_LEVEL:-}" != "${manifest_supervise_stderr_level}" ] ||
+ 		   [ "${CELL_SUPERVISE_TAG:-}" != "${manifest_supervise_tag}" ] ||
++		   [ "${CELL_SUPERVISE_RUN_AS:-}" != "${manifest_supervise_run_as}" ] ||
++		   [ "${CELL_SUPERVISE_RUN_UID:-}" != "${manifest_supervise_run_uid}" ] ||
++		   [ "${CELL_SUPERVISE_RUN_GID:-}" != "${manifest_supervise_run_gid}" ] ||
++		   [ "${CELL_SUPERVISE_RUN_GROUPS:-}" != "${manifest_supervise_run_groups}" ] ||
+ 		   [ "${CELL_DEPENDS_ON:-}" != "${manifest_depends_on}" ] ||
+ 		   [ "${CELL_HEALTHCHECK_CMD:-}" != "${manifest_healthcheck_cmd}" ] ||
+ 		   [ "${CELL_VOLUME_MOUNTS:-}" != "${manifest_volume_mounts}" ]; then
+@@ -5195,7 +5568,7 @@ reconcile_one_cell() {
+ 		emit_reconcile "${name}" "CREATE" "render runtime cell state"
+ 		changed=1
+ 	elif [ "${config_changed}" = "YES" ]; then
+-		emit_reconcile "${name}" "UPDATE" "reconcile runtime cell.conf"
++		emit_reconcile "${name}" "UPDATE" "reconcile runtime cell state"
+ 		changed=1
+ 	fi
+ 
+@@ -5258,7 +5631,9 @@ reconcile_one_cell() {
+ 		    "${manifest_supervise_facility}" "${manifest_supervise_stdout_level}" \
+ 		    "${manifest_supervise_stderr_level}" "${manifest_supervise_tag}" \
+ 		    "${manifest_depends_on}" "${manifest_healthcheck_cmd}" \
+-		    "${manifest_volume_mounts}"; then
++		    "${manifest_volume_mounts}" "${manifest_supervise_run_as}" \
++		    "${manifest_supervise_run_uid}" "${manifest_supervise_run_gid}" \
++		    "${manifest_supervise_run_groups}"; then
+ 			state_write "${STATE_DIR}/last_reconcile_result" "error:create"
+ 			emit_reconcile_result "${name}" "FAILED" "create"
+ 			return 1
+@@ -5273,7 +5648,9 @@ reconcile_one_cell() {
+ 		    "${manifest_supervise_facility}" \
+ 		    "${manifest_supervise_stdout_level}" "${manifest_supervise_stderr_level}" \
+ 		    "${manifest_supervise_tag}" "${manifest_depends_on}" \
+-		    "${manifest_healthcheck_cmd}" "${manifest_volume_mounts}"; then
++		    "${manifest_healthcheck_cmd}" "${manifest_volume_mounts}" \
++		    "${manifest_supervise_run_as}" "${manifest_supervise_run_uid}" \
++		    "${manifest_supervise_run_gid}" "${manifest_supervise_run_groups}"; then
+ 			state_write "${STATE_DIR}/last_reconcile_result" "error:render"
+ 			return 1
+ 		fi
+diff --git a/usr.sbin/cellmgr/cellmgr.8 b/usr.sbin/cellmgr/cellmgr.8
+index d0bf0a21061e..dbe1e2a31e30 100644
+--- a/usr.sbin/cellmgr/cellmgr.8
++++ b/usr.sbin/cellmgr/cellmgr.8
+@@ -49,6 +49,7 @@
+ .Op Cm --depends-on Ar dep[,dep...]
+ .Op Cm --healthcheck Ar command
+ .Op Cm --mount Ar source:/target[:ro|rw]
++.Op Cm --run-as Ar host:user[:group]|uid:uid[:gid]
+ .Op Cm --log-facility Ar facility
+ .Op Cm --stdout-level Ar level
+ .Op Cm --stderr-level Ar level
+@@ -80,6 +81,7 @@
+ .Op Cm --clear-healthcheck
+ .Op Cm --clear-mounts
+ .Op Cm --clear-log
++.Op Cm --clear-run-as
+ .Op Cm --scope Ar desired|both
+ .Nm
+ .Cm cell
+@@ -253,6 +255,28 @@ and
+ When unset, supervise processes keep the system default behavior
+ .Pq commonly unlimited on host defaults .
+ .Pp
++Optional supervised credential drop can be configured per cell using
++.Cm --run-as
++.Pq or
++.Va CELL_SUPERVISE_RUN_AS .
++Supported formats are
++.Ar host:user[:group]
++and
++.Ar uid:uid[:gid] .
++During
++.Cm apply ,
++host identities are resolved to numeric uid/gid/group values and rendered into
++runtime
++.Pa cell.conf ;
++service drift is detected when either the declarative spec or resolved numeric
++values change.
++Rendered runtime config stores
++.Va CELL_SUPERVISE_RUN_UID ,
++.Va CELL_SUPERVISE_RUN_GID ,
++and
++.Va CELL_SUPERVISE_RUN_GROUPS
++as derived fields.
++.Pp
+ Cell and volume names follow
+ .Dq [A-Za-z0-9._-] .
+ .Pp
+@@ -341,6 +365,14 @@ is set to
+ .Dq YES
+ in
+ .Pa /etc/cellmgr.conf .
++.Pp
++Supervised credential drop can be configured with
++.Cm --run-as
++.Pq Ar host:user[:group]\&|uid:uid[:gid] .
++For
++.Cm cell set ,
++.Cm --clear-run-as
++removes the run-as contract and reverts supervised processes to root.
+ .It Cm cell Cm remove Ar name|--all|--orphans Op Ar remove-options
+ Remove desired and/or runtime cell state according to
+ .Cm --scope .
+diff --git a/usr.sbin/cellmgr/examples/cellmgr.conf.sample b/usr.sbin/cellmgr/examples/cellmgr.conf.sample
+index bb75c09eaa72..ed470e8af716 100644
+--- a/usr.sbin/cellmgr/examples/cellmgr.conf.sample
++++ b/usr.sbin/cellmgr/examples/cellmgr.conf.sample
+@@ -56,3 +56,5 @@ CELL_PTYFS=YES
+ #   CELL_SUPERVISE_FACILITY (facility name, e.g. daemon/local0)
+ #   CELL_SUPERVISE_STDOUT_LEVEL (emerg..debug or 0..7)
+ #   CELL_SUPERVISE_STDERR_LEVEL (emerg..debug or 0..7)
++# Optional per-cell supervised credential drop:
++#   CELL_SUPERVISE_RUN_AS (host:user[:group] or uid:uid[:gid])
+diff --git a/usr.sbin/cellmgr/lib/cell.sh b/usr.sbin/cellmgr/lib/cell.sh
+index 6f50e0353e1f..923f12eb0700 100644
+--- a/usr.sbin/cellmgr/lib/cell.sh
++++ b/usr.sbin/cellmgr/lib/cell.sh
+@@ -18,6 +18,7 @@ run_cell_create() {
+ 	supervise_stdout_level=
+ 	supervise_stderr_level=
+ 	supervise_tag=
++	supervise_run_as=
+ 	depends_on=
+ 	healthcheck_cmd=
+ 	volume_mounts=
+@@ -128,6 +129,14 @@ run_cell_create() {
+ 			supervise_tag=$2
+ 			shift 2
+ 			;;
++		--run-as)
++			[ $# -ge 2 ] || {
++				echo "cell create: --run-as requires a value" >&2
++				return 1
++			}
++			supervise_run_as=$2
++			shift 2
++			;;
+ 		--scope)
+ 			[ $# -ge 2 ] || {
+ 				echo "cell create: --scope requires desired or both" >&2
+@@ -163,13 +172,16 @@ run_cell_create() {
+ 	validate_cell_rlimit "nofile" "${create_rlimit_nofile}" || return 1
+ 	validate_cell_rlimit "as" "${create_rlimit_as}" || return 1
+ 	validate_cell_rlimit "core" "${create_rlimit_core}" || return 1
++	validate_cell_run_as "${supervise_run_as}" "cell create" || return 1
++	supervise_run_as=${CELL_SUPERVISE_RUN_AS_NORMALIZED}
+ 
+ 	create_manifest_cell "${cell_name}" "${autostart}" "${supervise_cmd}" \
+ 	    "${create_profile}" "${create_reserved_ports}" \
+ 	    "${create_rlimit_nofile}" "${create_rlimit_as}" "${create_rlimit_core}" \
+ 	    "${supervise_facility}" "${supervise_stdout_level}" \
+ 	    "${supervise_stderr_level}" "${supervise_tag}" \
+-	    "${depends_on}" "${healthcheck_cmd}" "${volume_mounts}"
++	    "${depends_on}" "${healthcheck_cmd}" "${volume_mounts}" \
++	    "${supervise_run_as}"
+ 
+ 	if [ "${scope}" = "both" ]; then
+ 		run_reconcile_command "${cell_name}"
+@@ -197,6 +209,7 @@ run_cell_set() {
+ 	supervise_stdout_level=${CELL_SUPERVISE_STDOUT_LEVEL:-}
+ 	supervise_stderr_level=${CELL_SUPERVISE_STDERR_LEVEL:-}
+ 	supervise_tag=${CELL_SUPERVISE_TAG:-}
++	supervise_run_as=${CELL_SUPERVISE_RUN_AS:-}
+ 	depends_on=${CELL_DEPENDS_ON:-}
+ 	healthcheck_cmd=${CELL_HEALTHCHECK_CMD:-}
+ 	volume_mounts=${CELL_VOLUME_MOUNTS:-}
+@@ -282,6 +295,11 @@ run_cell_set() {
+ 			supervise_tag=$2
+ 			shift 2
+ 			;;
++		--run-as)
++			[ $# -ge 2 ] || return 1
++			supervise_run_as=$2
++			shift 2
++			;;
+ 		--clear-reserved-ports)
+ 			create_reserved_ports=
+ 			shift
+@@ -318,6 +336,10 @@ run_cell_set() {
+ 			supervise_tag=
+ 			shift
+ 			;;
++		--clear-run-as)
++			supervise_run_as=
++			shift
++			;;
+ 		--scope)
+ 			[ $# -ge 2 ] || return 1
+ 			scope=$2
+@@ -346,13 +368,16 @@ run_cell_set() {
+ 	validate_cell_rlimit "nofile" "${create_rlimit_nofile}" || return 1
+ 	validate_cell_rlimit "as" "${create_rlimit_as}" || return 1
+ 	validate_cell_rlimit "core" "${create_rlimit_core}" || return 1
++	validate_cell_run_as "${supervise_run_as}" "cell set" || return 1
++	supervise_run_as=${CELL_SUPERVISE_RUN_AS_NORMALIZED}
+ 
+ 	set_manifest_cell "${cell_name}" "${autostart}" "${supervise_cmd}" \
+ 	    "${create_profile}" "${create_reserved_ports}" \
+ 	    "${create_rlimit_nofile}" "${create_rlimit_as}" "${create_rlimit_core}" \
+ 	    "${supervise_facility}" "${supervise_stdout_level}" \
+ 	    "${supervise_stderr_level}" "${supervise_tag}" \
+-	    "${depends_on}" "${healthcheck_cmd}" "${volume_mounts}"
++	    "${depends_on}" "${healthcheck_cmd}" "${volume_mounts}" \
++	    "${supervise_run_as}"
+ 
+ 	if [ "${scope}" = "both" ]; then
+ 		run_reconcile_command "${cell_name}"
+diff --git a/usr.sbin/cellmgr/lib/common.sh b/usr.sbin/cellmgr/lib/common.sh
+index 338ec30261be..9332144954cc 100644
+--- a/usr.sbin/cellmgr/lib/common.sh
++++ b/usr.sbin/cellmgr/lib/common.sh
+@@ -61,6 +61,15 @@ validate_cell_rlimit() {
+ 	return 0
+ }
+ 
++validate_cell_run_as() {
++	run_as_value=${1:-}
++	run_as_origin=${2:-run-as}
++	if ! validate_cell_supervise_run_as "${run_as_value}" "${run_as_origin}"; then
++		return 1
++	fi
++	return 0
++}
++
+ set_cell_autostart_if_manifest() {
+ 	autostart_cell_name=$1
+ 	autostart_value=$2
+@@ -74,5 +83,6 @@ set_cell_autostart_if_manifest() {
+ 	    "${CELL_CREATE_RLIMIT_CORE:-}" \
+ 	    "${CELL_SUPERVISE_FACILITY:-}" "${CELL_SUPERVISE_STDOUT_LEVEL:-}" \
+ 	    "${CELL_SUPERVISE_STDERR_LEVEL:-}" "${CELL_SUPERVISE_TAG:-}" \
+-	    "${CELL_DEPENDS_ON:-}" "${CELL_HEALTHCHECK_CMD:-}" "${CELL_VOLUME_MOUNTS:-}"
++	    "${CELL_DEPENDS_ON:-}" "${CELL_HEALTHCHECK_CMD:-}" \
++	    "${CELL_VOLUME_MOUNTS:-}" "${CELL_SUPERVISE_RUN_AS:-}"
+ }
+-- 
+2.47.3
+
