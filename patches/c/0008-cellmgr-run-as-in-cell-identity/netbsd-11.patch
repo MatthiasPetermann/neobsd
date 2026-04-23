@@ -1,0 +1,400 @@
+From 0d86d570e957314db3f5e69c670156fc039aedfc Mon Sep 17 00:00:00 2001
+From: Matthias Petermann <mp@petermann-it.de>
+Date: Thu, 23 Apr 2026 19:13:57 +0200
+Subject: [PATCH] cellmgr: add in-cell run-as identity resolution
+
+Support `cell:user[:group]` for `--run-as` / `CELL_SUPERVISE_RUN_AS` and
+resolve UID/GID/groups from the cell user database during apply.
+Update CLI help, documentation, examples, and manpages accordingly.
+---
+ doc/specs/netbsd-cells-specification.txt      |   5 +-
+ etc/cellmgr.conf                              |   2 +-
+ usr.sbin/cellmgr/README.md                    |   6 +
+ usr.sbin/cellmgr/cellmgr                      | 191 +++++++++++++++++-
+ usr.sbin/cellmgr/cellmgr.8                    |  17 +-
+ usr.sbin/cellmgr/examples/README              |   2 +
+ usr.sbin/cellmgr/examples/cellmgr.conf.sample |   2 +-
+ .../cellmgr/examples/manifest.cell.sample     |   2 +-
+ 8 files changed, 213 insertions(+), 14 deletions(-)
+
+diff --git a/doc/specs/netbsd-cells-specification.txt b/doc/specs/netbsd-cells-specification.txt
+index d20738114ad1..a013a046c50a 100644
+--- a/doc/specs/netbsd-cells-specification.txt
++++ b/doc/specs/netbsd-cells-specification.txt
+@@ -123,7 +123,7 @@ Cell manifest (`<name>.cell`) keys:
+ - `CELL_SUPERVISE_STDERR_LEVEL`
+ - `CELL_SUPERVISE_TAG`
+ - `CELL_SUPERVISE_CMD` (required)
+-- `CELL_SUPERVISE_RUN_AS` (`host:user[:group]` or `uid:uid[:gid]`)
++- `CELL_SUPERVISE_RUN_AS` (`host:user[:group]`, `cell:user[:group]`, or `uid:uid[:gid]`)
+ - `CELL_DEPENDS_ON` (comma-separated cell names)
+ - `CELL_HEALTHCHECK_CMD`
+ - `CELL_VOLUME_MOUNTS` (`<volume>:<target>[:ro|rw]`, normalized to explicit mode)
+@@ -250,7 +250,8 @@ Cell reconcile behavior summary:
+ - create/update runtime `cell.conf` when manifest drift exists
+ - enforce autostart intent (`start`/`stop`)
+ - restart service when supervise config changed
+-- resolve `CELL_SUPERVISE_RUN_AS` to runtime numeric uid/gid/groups and render
++- resolve `CELL_SUPERVISE_RUN_AS` to runtime numeric uid/gid/groups (host
++  identities on host, cell identities from cell passwd/group databases) and render
+   resolved values into runtime `cell.conf`; treat resolved drift as service drift
+ - policy-only drift (`profile/ports/rlimits`):
+   - warning by default
+diff --git a/etc/cellmgr.conf b/etc/cellmgr.conf
+index f0ba42c1c063..3bb4ee0971a7 100644
+--- a/etc/cellmgr.conf
++++ b/etc/cellmgr.conf
+@@ -60,4 +60,4 @@ CELL_PTYFS=YES
+ #   CELL_SUPERVISE_STDOUT_LEVEL (emerg..debug or 0..7)
+ #   CELL_SUPERVISE_STDERR_LEVEL (emerg..debug or 0..7)
+ # Optional per-cell supervised credential drop:
+-#   CELL_SUPERVISE_RUN_AS (host:user[:group] or uid:uid[:gid])
++#   CELL_SUPERVISE_RUN_AS (host:user[:group], cell:user[:group], or uid:uid[:gid])
+diff --git a/usr.sbin/cellmgr/README.md b/usr.sbin/cellmgr/README.md
+index c92e9e98b73b..e4f0ed23e06a 100644
+--- a/usr.sbin/cellmgr/README.md
++++ b/usr.sbin/cellmgr/README.md
+@@ -43,6 +43,12 @@ Mount specs in `--mount` and `CELL_VOLUME_MOUNTS` use:
+ - `<volume|/host/path>:<target>[:ro|rw]`
+ - host-path sources require `CELL_ALLOW_HOST_MOUNTS=YES` in `/etc/cellmgr.conf`
+ 
++Run identity specs in `--run-as` and `CELL_SUPERVISE_RUN_AS` use:
++
++- `host:user[:group]` (resolve user/group on the host)
++- `cell:user[:group]` (resolve user/group from the cell `/etc/passwd` and `/etc/group`)
++- `uid:uid[:gid]` (explicit numeric identity)
++
+ Typical examples:
+ 
+ ```sh
+diff --git a/usr.sbin/cellmgr/cellmgr b/usr.sbin/cellmgr/cellmgr
+index fef3afe671cd..9d5aebc246e7 100755
+--- a/usr.sbin/cellmgr/cellmgr
++++ b/usr.sbin/cellmgr/cellmgr
+@@ -274,7 +274,7 @@ Cell commands:
+       [--rlimit-nofile n|unlimited] [--rlimit-as bytes|unlimited]
+       [--rlimit-core bytes|unlimited]
+       [--depends-on deps] [--healthcheck cmd] [--mount spec]
+-      [--run-as host:user[:group]|uid:uid[:gid]]
++      [--run-as host:user[:group]|cell:user[:group]|uid:uid[:gid]]
+       [--log-facility fac] [--stdout-level lvl] [--stderr-level lvl]
+       [--log-tag tag] [--scope desired|both]
+   cell set <name> [same options as create] [--clear-reserved-ports]
+@@ -322,7 +322,7 @@ Notes:
+   - With -T, output is stable TSV and includes a header unless -H is set.
+   - --mount accepts <volume|/host/path>:/target[:ro|rw].
+     Host paths require CELL_ALLOW_HOST_MOUNTS=YES.
+-  - --run-as accepts host:user[:group] or uid:uid[:gid].
++  - --run-as accepts host:user[:group], cell:user[:group], or uid:uid[:gid].
+   - apply owner/group options support @run_uid/@run_gid placeholders.
+   - Destructive --all/--orphans operations require --yes when non-interactive.
+ 
+@@ -532,8 +532,47 @@ validate_cell_supervise_run_as() {
+ 		CELL_SUPERVISE_RUN_AS_NORMALIZED="host:${run_as_user}:${run_as_group}"
+ 		return 0
+ 		;;
++	cell:*)
++		run_as_body=${run_as_spec#cell:}
++		set -f
++		run_as_old_ifs=${IFS}
++		IFS=:
++		set -- ${run_as_body}
++		IFS=${run_as_old_ifs}
++		set +f
++
++		if [ $# -eq 1 ]; then
++			run_as_user=$1
++			run_as_group=
++		elif [ $# -eq 2 ]; then
++			run_as_user=$1
++			run_as_group=$2
++		else
++			echo "${run_as_origin}: invalid --run-as '${run_as_spec}' (expected cell:user[:group])" >&2
++			return 1
++		fi
++
++		case "${run_as_user}" in
++		""|*[!A-Za-z0-9._-]*)
++			echo "${run_as_origin}: invalid user in --run-as '${run_as_spec}'" >&2
++			return 1
++			;;
++		esac
++		case "${run_as_group}" in
++		"" )
++			CELL_SUPERVISE_RUN_AS_NORMALIZED="cell:${run_as_user}"
++			return 0
++			;;
++		*[!A-Za-z0-9._-]*)
++			echo "${run_as_origin}: invalid group in --run-as '${run_as_spec}'" >&2
++			return 1
++			;;
++		esac
++		CELL_SUPERVISE_RUN_AS_NORMALIZED="cell:${run_as_user}:${run_as_group}"
++		return 0
++		;;
+ 	*)
+-		echo "${run_as_origin}: invalid --run-as '${run_as_spec}' (expected host:user[:group] or uid:uid[:gid])" >&2
++		echo "${run_as_origin}: invalid --run-as '${run_as_spec}' (expected host:user[:group], cell:user[:group], or uid:uid[:gid])" >&2
+ 		return 1
+ 		;;
+ 	esac
+@@ -571,9 +610,39 @@ resolve_host_group_gid() {
+ 	esac
+ }
+ 
++resolve_cell_group_gid() {
++	run_as_group=$1
++	cell_group_file=$2
++	case "${run_as_group}" in
++	"" )
++		echo "resolve group gid: empty group" >&2
++		return 1
++		;;
++	*[!0-9]*)
++		run_as_gid=$(awk -F: -v g="${run_as_group}" '
++			$1 == g { print $3; exit }
++		' "${cell_group_file}" 2>/dev/null || true)
++		case "${run_as_gid}" in
++		""|*[!0-9]*)
++			echo "unable to resolve group '${run_as_group}' in ${cell_group_file}" >&2
++			return 1
++			;;
++		esac
++		printf '%s\n' "${run_as_gid}"
++		return 0
++		;;
++	*)
++		printf '%s\n' "${run_as_group}"
++		return 0
++		;;
++	esac
++}
++
+ resolve_cell_supervise_run_as() {
+ 	run_as_spec=${1:-}
+ 	run_as_origin=${2:-run-as}
++	run_as_cell_root=${3:-${ROOT_DIR:-}}
++	run_as_overlay_root=${4:-${OVERLAY_DIR:-}}
+ 	RESOLVED_SUPERVISE_RUN_UID=
+ 	RESOLVED_SUPERVISE_RUN_GID=
+ 	RESOLVED_SUPERVISE_RUN_GROUPS=
+@@ -676,6 +745,120 @@ resolve_cell_supervise_run_as() {
+ 			return 1
+ 		fi
+ 
++		RESOLVED_SUPERVISE_RUN_UID=${run_as_uid}
++		RESOLVED_SUPERVISE_RUN_GID=${run_as_gid}
++		RESOLVED_SUPERVISE_RUN_GROUPS=${run_as_groups_csv}
++		return 0
++		;;
++	cell:*)
++		run_as_body=${run_as_spec#cell:}
++		set -f
++		run_as_old_ifs=${IFS}
++		IFS=:
++		set -- ${run_as_body}
++		IFS=${run_as_old_ifs}
++		set +f
++		run_as_user=$1
++		run_as_group=${2:-}
++
++		run_as_cell_passwd=
++		run_as_cell_group=
++		run_as_cell_source=
++		for candidate_root in "${run_as_cell_root}" "${run_as_overlay_root}" "${BASE_LAYER:-}"; do
++			[ -n "${candidate_root}" ] || continue
++			if [ -r "${candidate_root}/etc/passwd" ]; then
++				candidate_passwd="${candidate_root}/etc/passwd"
++			elif [ -r "${candidate_root}/etc/master.passwd" ]; then
++				candidate_passwd="${candidate_root}/etc/master.passwd"
++			else
++				continue
++			fi
++			if [ ! -r "${candidate_root}/etc/group" ]; then
++				continue
++			fi
++			run_as_cell_source=${candidate_root}
++			run_as_cell_passwd=${candidate_passwd}
++			run_as_cell_group="${candidate_root}/etc/group"
++			break
++		done
++
++		if [ -z "${run_as_cell_passwd}" ] || [ -z "${run_as_cell_group}" ]; then
++			echo "${run_as_origin}: unable to load cell passwd/group databases for --run-as '${run_as_spec}'" >&2
++			return 1
++		fi
++
++		run_as_uid=$(awk -F: -v u="${run_as_user}" '
++			$1 == u { print $3; exit }
++		' "${run_as_cell_passwd}" 2>/dev/null || true)
++		run_as_primary_gid=$(awk -F: -v u="${run_as_user}" '
++			$1 == u { print $4; exit }
++		' "${run_as_cell_passwd}" 2>/dev/null || true)
++		case "${run_as_uid}" in
++		""|*[!0-9]*)
++			echo "${run_as_origin}: unable to resolve user '${run_as_user}' in ${run_as_cell_source}" >&2
++			return 1
++			;;
++		esac
++		case "${run_as_primary_gid}" in
++		""|*[!0-9]*)
++			echo "${run_as_origin}: unable to resolve primary gid for user '${run_as_user}' in ${run_as_cell_source}" >&2
++			return 1
++			;;
++		esac
++
++		if [ -n "${run_as_group}" ]; then
++			run_as_gid=$(resolve_cell_group_gid "${run_as_group}" "${run_as_cell_group}") || return 1
++		else
++			run_as_gid=${run_as_primary_gid}
++		fi
++		case "${run_as_gid}" in
++		""|*[!0-9]*)
++			echo "${run_as_origin}: unable to resolve gid for user '${run_as_user}' in ${run_as_cell_source}" >&2
++			return 1
++			;;
++		esac
++
++		run_as_groups_csv=$(awk -F: -v u="${run_as_user}" -v pgid="${run_as_primary_gid}" '
++			BEGIN {
++				if (pgid ~ /^[0-9]+$/ && !seen[pgid]++) {
++					out = pgid
++				}
++			}
++			$3 ~ /^[0-9]+$/ {
++				n = split($4, members, ",")
++				for (i = 1; i <= n; i++) {
++					if (members[i] == u) {
++						if (!seen[$3]++) {
++							if (out == "")
++								out = $3
++							else
++								out = out "," $3
++						}
++						break
++					}
++				}
++			}
++			END {
++				print out
++			}
++		' "${run_as_cell_group}" 2>/dev/null || true)
++
++		case ",${run_as_groups_csv}," in
++		*",${run_as_gid},"*)
++			;;
++		*)
++			if [ -n "${run_as_groups_csv}" ]; then
++				run_as_groups_csv="${run_as_groups_csv},${run_as_gid}"
++			else
++				run_as_groups_csv=${run_as_gid}
++			fi
++			;;
++		esac
++
++		if ! validate_gid_csv "${run_as_groups_csv}" "${run_as_origin}"; then
++			return 1
++		fi
++
+ 		RESOLVED_SUPERVISE_RUN_UID=${run_as_uid}
+ 		RESOLVED_SUPERVISE_RUN_GID=${run_as_gid}
+ 		RESOLVED_SUPERVISE_RUN_GROUPS=${run_as_groups_csv}
+@@ -5618,7 +5801,7 @@ reconcile_one_cell() {
+ 	manifest_healthcheck_cmd=${CELL_HEALTHCHECK_CMD:-}
+ 	manifest_volume_mounts=${CELL_VOLUME_MOUNTS:-}
+ 	cell_paths "${name}"
+-	if ! resolve_cell_supervise_run_as "${manifest_supervise_run_as}" "manifest ${MANIFEST_CELL_CONF}"; then
++	if ! resolve_cell_supervise_run_as "${manifest_supervise_run_as}" "manifest ${MANIFEST_CELL_CONF}" "${ROOT_DIR}" "${OVERLAY_DIR}"; then
+ 		state_write "${STATE_DIR}/last_reconcile_result" "error:resolve-run-as"
+ 		emit_reconcile_result "${name}" "FAILED" "resolve-run-as"
+ 		return 1
+diff --git a/usr.sbin/cellmgr/cellmgr.8 b/usr.sbin/cellmgr/cellmgr.8
+index c5179064564f..749258b993f0 100644
+--- a/usr.sbin/cellmgr/cellmgr.8
++++ b/usr.sbin/cellmgr/cellmgr.8
+@@ -1,5 +1,5 @@
+ ." $NetBSD$
+-.Dd April 20, 2026
++.Dd April 23, 2026
+ .Dt CELLMGR 8
+ .Os
+ .Sh NAME
+@@ -49,7 +49,7 @@
+ .Op Cm --depends-on Ar dep[,dep...]
+ .Op Cm --healthcheck Ar command
+ .Op Cm --mount Ar source:/target[:ro|rw]
+-.Op Cm --run-as Ar host:user[:group]|uid:uid[:gid]
++.Op Cm --run-as Ar host:user[:group]|cell:user[:group]|uid:uid[:gid]
+ .Op Cm --log-facility Ar facility
+ .Op Cm --stdout-level Ar level
+ .Op Cm --stderr-level Ar level
+@@ -260,12 +260,19 @@ Optional supervised credential drop can be configured per cell using
+ .Pq or
+ .Va CELL_SUPERVISE_RUN_AS .
+ Supported formats are
+-.Ar host:user[:group]
++.Ar host:user[:group] ,
++.Ar cell:user[:group] ,
+ and
+ .Ar uid:uid[:gid] .
+ During
+ .Cm apply ,
+-host identities are resolved to numeric uid/gid/group values and rendered into
++host identities are resolved on the host and
++cell identities are resolved from the cell's
++.Pa /etc/passwd
++and
++.Pa /etc/group
++databases;
++the resulting numeric uid/gid/group values are rendered into
+ runtime
+ .Pa cell.conf ;
+ service drift is detected when either the declarative spec or resolved numeric
+@@ -393,7 +400,7 @@ in
+ .Pp
+ Supervised credential drop can be configured with
+ .Cm --run-as
+-.Pq Ar host:user[:group]\&|uid:uid[:gid] .
++.Pq Ar host:user[:group]\&|cell:user[:group]\&|uid:uid[:gid] .
+ For
+ .Cm cell set ,
+ .Cm --clear-run-as
+diff --git a/usr.sbin/cellmgr/examples/README b/usr.sbin/cellmgr/examples/README
+index 52fccf578bfd..bf0e455035ce 100644
+--- a/usr.sbin/cellmgr/examples/README
++++ b/usr.sbin/cellmgr/examples/README
+@@ -145,6 +145,8 @@ Copy example manifests into `/etc/cellmgr` and run:
+ `DIR`, `COPY`, and `FILE_BEGIN` accept `owner=@run_uid` and
+ `group=@run_gid` placeholders. These resolve from
+ `CELL_SUPERVISE_RUN_AS` into rendered runtime `CELL_SUPERVISE_RUN_UID/GID`.
++Run-as specs support `host:user[:group]`, `cell:user[:group]`, and
++`uid:uid[:gid]` formats.
+ 
+ `EXEC` directives run with `CELLMGR_RUN_UID`, `CELLMGR_RUN_GID`, and
+ `CELLMGR_RUN_GROUPS` exported in the cell shell.
+diff --git a/usr.sbin/cellmgr/examples/cellmgr.conf.sample b/usr.sbin/cellmgr/examples/cellmgr.conf.sample
+index ed470e8af716..075f3bbe4e9d 100644
+--- a/usr.sbin/cellmgr/examples/cellmgr.conf.sample
++++ b/usr.sbin/cellmgr/examples/cellmgr.conf.sample
+@@ -57,4 +57,4 @@ CELL_PTYFS=YES
+ #   CELL_SUPERVISE_STDOUT_LEVEL (emerg..debug or 0..7)
+ #   CELL_SUPERVISE_STDERR_LEVEL (emerg..debug or 0..7)
+ # Optional per-cell supervised credential drop:
+-#   CELL_SUPERVISE_RUN_AS (host:user[:group] or uid:uid[:gid])
++#   CELL_SUPERVISE_RUN_AS (host:user[:group], cell:user[:group], or uid:uid[:gid])
+diff --git a/usr.sbin/cellmgr/examples/manifest.cell.sample b/usr.sbin/cellmgr/examples/manifest.cell.sample
+index cf26f4a0212e..b1789efb47cb 100644
+--- a/usr.sbin/cellmgr/examples/manifest.cell.sample
++++ b/usr.sbin/cellmgr/examples/manifest.cell.sample
+@@ -21,7 +21,7 @@ CELL_SUPERVISE_CMD="/usr/libexec/httpd -I 8080 -X -s -f /var/www/example"
+ 
+ # Optional supervised run identity contract. During apply, cellmgr resolves
+ # this into numeric CELL_SUPERVISE_RUN_UID/GID/GROUPS in runtime cell.conf.
+-# Example: CELL_SUPERVISE_RUN_AS="host:www:www"
++# Examples: CELL_SUPERVISE_RUN_AS="host:www:www" or "cell:www:www"
+ CELL_SUPERVISE_RUN_AS=""
+ 
+ # Optional dependency graph and health probe
+-- 
+2.47.3
+
