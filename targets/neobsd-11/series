@@ -1,10 +1,2 @@
 k/0001-re-wake-on-lan
-c/0002-cells-core
-c/0003-cellmgr-host-path-mounts
-c/0004-cellmgr-copy-untar
-c/0005-cellmgr-opt
-c/0006-cells-runas
-c/0007-cellmgr-run-as-placeholders
-c/0008-cellmgr-run-as-in-cell-identity
-c/0009-cellman
-c/0010-cellman-bugfix
+c/0009-cells-reloaded
