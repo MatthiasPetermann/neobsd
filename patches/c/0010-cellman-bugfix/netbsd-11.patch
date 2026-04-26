@@ -1,0 +1,42 @@
+From d1188c4e473dd5edab1d0c61e6900b5485be2027 Mon Sep 17 00:00:00 2001
+From: Matthias Petermann <mp@petermann-it.de>
+Date: Sun, 26 Apr 2026 14:24:58 +0200
+Subject: [PATCH] Fix build path
+
+---
+ usr.sbin/cellman/Makefile | 4 ++--
+ usr.sbin/cellui/Makefile  | 5 +++--
+ 2 files changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/usr.sbin/cellman/Makefile b/usr.sbin/cellman/Makefile
+index e0c6f051cba2..af957d17584d 100644
+--- a/usr.sbin/cellman/Makefile
++++ b/usr.sbin/cellman/Makefile
+@@ -23,7 +23,7 @@ libcellman.a: ${LIBCELLMAN_OBJS}
+ 
+ ${PROG}: libcellman.a
+ 
+-DPADD+=	${.CURDIR}/libcellman.a ${LIBLUA} ${LIBM}
+-LDADD+=	${.CURDIR}/libcellman.a -llua -lm
++DPADD+=	libcellman.a ${LIBLUA} ${LIBM}
++LDADD+=	libcellman.a -llua -lm
+ 
+ .include <bsd.prog.mk>
+diff --git a/usr.sbin/cellui/Makefile b/usr.sbin/cellui/Makefile
+index c6ced4cb7caf..f2a9b35a947d 100644
+--- a/usr.sbin/cellui/Makefile
++++ b/usr.sbin/cellui/Makefile
+@@ -9,7 +9,8 @@ MAN=	cellui.8
+ WARNS?=	4
+ COPTS+=	-std=c99
+ 
+-DPADD+=	${.CURDIR}/../cellman/libcellman.a ${LIBCURSES} ${LIBTERMINFO} ${LIBLUA} ${LIBM}
+-LDADD+=	${.CURDIR}/../cellman/libcellman.a -lcurses -lterminfo -llua -lm
++LIBCELLMAN!=	cd ${.CURDIR}/../cellman && ${PRINTOBJDIR}
++DPADD+=	${LIBCELLMAN}/libcellman.a ${LIBCURSES} ${LIBTERMINFO} ${LIBLUA} ${LIBM}
++LDADD+=	-L${LIBCELLMAN} -lcellman -lcurses -lterminfo -llua -lm
+ 
+ .include <bsd.prog.mk>
+-- 
+2.47.3
+
