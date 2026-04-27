@@ -1,0 +1,95 @@
+{
+  "product": "NeoBSD",
+  "series": "26.x",
+  "release_notes": [
+    {
+      "tag": "26.0",
+      "release_date": "2026-04-12",
+      "headline": "The foundation for reproducible NeoBSD releases",
+      "summary": "NeoBSD 26.0 establishes the core: a clear release architecture with targets, profile-driven builds, and ordered patch series. The result is predictable, reproducible releases from source state to final artifact.",
+      "highlights": [
+        "Introduced the core model for targets and release intent",
+        "Profile-based build configuration as a default baseline",
+        "Reliable orchestration for preparation, patching, build, and publishing"
+      ]
+    },
+    {
+      "tag": "26.1",
+      "release_date": "2026-04-17",
+      "headline": "More mount flexibility, no compromise on safety",
+      "summary": "With 26.1, cell mounts become more flexible: optional host-path nullfs mounts are now possible while staying explicitly opt-in by design. The neobsd-11 target patch state was also cleanly integrated.",
+      "highlights": [
+        "Optional host-path mounts for cells",
+        "Secure defaults remain intact (explicit opt-in)",
+        "Updated patch state for neobsd-11"
+      ]
+    },
+    {
+      "tag": "26.2",
+      "release_date": "2026-04-18",
+      "headline": "Faster path from host artifacts to running cells",
+      "summary": "26.2 modernizes artifact workflows with declarative COPY and UNTAR steps. It also adds optional profile-based build branding, improving day-to-day usability and giving releases a clearer identity.",
+      "highlights": [
+        "New COPY and UNTAR directives",
+        "Automatic reconciliation when source artifacts change",
+        "Optional profile-driven branding for build.sh"
+      ]
+    },
+    {
+      "tag": "26.3",
+      "release_date": "2026-04-19",
+      "headline": "A clean home for vendor software in every cell",
+      "summary": "With 26.3, each cell gets a writable /opt overlay path. That gives third-party software outside pkg/pkgsrc a consistent, well-structured place in the system layout.",
+      "highlights": [
+        "Writable per-cell /opt via overlay",
+        "Cleaner structure for vendor deployments",
+        "Consistent behavior with existing overlay mechanics"
+      ]
+    },
+    {
+      "tag": "26.4",
+      "release_date": "2026-04-20",
+      "headline": "Declarative run-as for safer, deterministic services",
+      "summary": "26.4 takes supervised services to the next level: run-as is now declarative, identities are resolved cleanly, and supervision follows a fail-closed model. That means stronger security and more predictable runtime behavior.",
+      "highlights": [
+        "Declarative run-as for supervised services",
+        "Reliable runtime UID/GID/group resolution",
+        "Least-privilege execution with deterministic startup flow"
+      ]
+    },
+    {
+      "tag": "26.5",
+      "release_date": "2026-04-20",
+      "headline": "File ownership now follows runtime identity automatically",
+      "summary": "With 26.5, apply plans become even more practical: ownership placeholders tie file permissions directly to service runtime identities. This reduces operational friction and prevents permission drift.",
+      "highlights": [
+        "owner=@run_uid and group=@run_gid in apply plans",
+        "Support across DIR, COPY, and FILE_BEGIN",
+        "Run identity now influences apply reconciliation"
+      ]
+    },
+    {
+      "tag": "26.6",
+      "release_date": "2026-04-23",
+      "headline": "Resolve run-as identities directly inside the cell",
+      "summary": "26.6 makes identity mapping feel natural: run-as can be defined in cell context using cell:user[:group]. This simplifies configuration, especially in larger multi-cell environments.",
+      "highlights": [
+        "In-cell identity resolution for run-as",
+        "Support for cell:user[:group] syntax",
+        "Consistent behavior across CLI, docs, and man pages"
+      ]
+    },
+    {
+      "tag": "26.7",
+      "release_date": "2026-04-26",
+      "headline": "Cells v3 has arrived: a new control plane for the next stage",
+      "summary": "26.7 is a major leap forward: with cellman/libcellman and a Lua DSL, the third generation of cell control plane is now integrated. The result is a clearer operations model with stronger structure, safety, and scalability.",
+      "highlights": [
+        "Introduced the v3 control plane (cellman/libcellman)",
+        "Declarative Lua models for desired system state",
+        "Stronger safety defaults and runtime guards",
+        "Integrated consolidated third-generation cells into NeoBSD"
+      ]
+    }
+  ]
+}
