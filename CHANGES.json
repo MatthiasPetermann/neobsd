@@ -90,6 +90,17 @@
         "Stronger safety defaults and runtime guards",
         "Integrated consolidated third-generation cells into NeoBSD"
       ]
+    },
+    {
+      "tag": "26.8",
+      "release_date": "2026-04-26",
+      "headline": "Bugfix: Restored missing cellman examples",
+      "summary": "NeoBSD 26.8 addresses an oversight in 26.7 where the cellman examples were unintentionally omitted. This release restores the complete set of examples, ensuring that the new v3 control plane can be explored and adopted with proper guidance.",
+      "highlights": [
+        "Restored missing cellman example configurations",
+        "Improved out-of-the-box usability of the v3 control plane",
+        "No functional changes to core system behavior"
+      ]
     }
   ]
 }
