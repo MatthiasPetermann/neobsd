@@ -101,6 +101,17 @@
         "Improved out-of-the-box usability of the v3 control plane",
         "No functional changes to core system behavior"
       ]
+    },
+    {
+      "tag": "26.9",
+      "release_date": "2026-09-29",
+      "headline": "Re-based on NetBSD 11.0_RC4",
+      "summary": "NeoBSD 26.9 rebases the system on top of NetBSD 11.0_RC4 to align with the newer upstream foundation and keep target behavior current.",
+      "highlights": [
+        "Re-based NeoBSD on NetBSD 11.0_RC4",
+        "Aligned base system with current upstream release candidate",
+        "Prepared the groundwork for follow-up compatibility updates"
+      ]
     }
   ]
 }
