@@ -112,6 +112,19 @@
         "Aligned base system with current upstream release candidate",
         "Prepared the groundwork for follow-up compatibility updates"
       ]
+    },
+    {
+      "tag": "26.10",
+      "release_date": "2026-10-26",
+      "headline": "Hardened secmodel_cell with transactional lifecycle and stronger ABI defenses",
+      "summary": "NeoBSD 26.10 significantly strengthens secmodel_cell internals. Cell create, enter, and destroy paths now use explicit lifecycle states, hold-based quiescence checks, and strict lock-order discipline to close race windows under concurrent churn. Sysctl control paths enforce bounded NUL-terminated text input and sequence-coherent list snapshots, while policy denies now expose atomic counters and per-scope rate-limited audit telemetry.",
+      "highlights": [
+        "Introduced explicit lifecycle-state and hold-counted transactions so destroy and enter cannot race into inconsistent membership state",
+        "Hardened management input handling with bounded NUL checks, control-character rejection, and stricter fixed-size payload validation",
+        "Made list/stat exports snapshot-coherent across lock drop/reacquire boundaries with sequence validation and overflow-aware sizing",
+        "Added atomic deny counters and per-scope rate-limited audit logging for process, system, and network policy rejects",
+        "Improved module lifecycle hygiene with clean listener-start failure unwinds and consistent teardown of runtime resources"
+      ]
     }
   ]
 }
