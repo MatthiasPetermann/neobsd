@@ -104,7 +104,7 @@
     },
     {
       "tag": "26.9",
-      "release_date": "2026-09-29",
+      "release_date": "2026-05-14",
       "headline": "Re-based on NetBSD 11.0_RC4",
       "summary": "NeoBSD 26.9 rebases the system on top of NetBSD 11.0_RC4 to align with the newer upstream foundation and keep target behavior current.",
       "highlights": [
@@ -115,7 +115,7 @@
     },
     {
       "tag": "26.10",
-      "release_date": "2026-10-26",
+      "release_date": "2026-05-14",
       "headline": "Hardened secmodel_cell with transactional lifecycle and stronger ABI defenses",
       "summary": "NeoBSD 26.10 significantly strengthens secmodel_cell internals. Cell create, enter, and destroy paths now use explicit lifecycle states, hold-based quiescence checks, and strict lock-order discipline to close race windows under concurrent churn. Sysctl control paths enforce bounded NUL-terminated text input and sequence-coherent list snapshots, while policy denies now expose atomic counters and per-scope rate-limited audit telemetry.",
       "highlights": [
