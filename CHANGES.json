@@ -124,7 +124,7 @@
         "Made list/stat exports snapshot-coherent across lock drop/reacquire boundaries with sequence validation and overflow-aware sizing",
         "Added atomic deny counters and per-scope rate-limited audit logging for process, system, and network policy rejects",
         "Improved module lifecycle hygiene with clean listener-start failure unwinds and consistent teardown of runtime resources"
-      
+      ]     
     },
     {
       "tag": "26.11",
