@@ -124,7 +124,19 @@
         "Made list/stat exports snapshot-coherent across lock drop/reacquire boundaries with sequence validation and overflow-aware sizing",
         "Added atomic deny counters and per-scope rate-limited audit logging for process, system, and network policy rejects",
         "Improved module lifecycle hygiene with clean listener-start failure unwinds and consistent teardown of runtime resources"
+      
+    },
+    {
+      "tag": "26.11",
+      "release_date": "2026-05-15",
+      "headline": "Rebuild with post-RC4 NetBSD fixes, including Postfix regression repair",
+      "summary": "NeoBSD 26.11 is a rebuild release that integrates all bug fixes received after the publication of NetBSD 11.0_RC4. The update is primarily focused on stability and correctness, with special attention to resolving a Postfix regression introduced in the RC4 timeframe.",
+      "highlights": [
+        "Rebuilt release artifacts on top of the NetBSD 11.0_RC4 baseline with all post-RC4 upstream fixes",
+        "Integrated cumulative bug fixes reported and merged after NetBSD 11.0_RC4 publication",
+        "Fixed a Postfix regression to restore expected mail delivery behavior"
       ]
-    }
+    },
+
   ]
 }
