@@ -136,7 +136,6 @@
         "Integrated cumulative bug fixes reported and merged after NetBSD 11.0_RC4 publication",
         "Fixed a Postfix regression to restore expected mail delivery behavior"
       ]
-    },
-
+    }
   ]
 }
