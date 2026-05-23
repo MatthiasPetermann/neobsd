@@ -136,6 +136,17 @@
         "Integrated cumulative bug fixes reported and merged after NetBSD 11.0_RC4 publication",
         "Fixed a Postfix regression to restore expected mail delivery behavior"
       ]
+    },
+    {
+      "tag": "26.12",
+      "release_date": "2026-05-23",
+      "headline": "Rebuild with additional RC4 bug fixes",
+      "summary": "NeoBSD 26.12 is a rebuild release in the same spirit as 26.11, integrating additional bug fixes that were merged for the NetBSD 11.0_RC4 line. The update remains focused on stability and correctness.",
+      "highlights": [
+        "Rebuilt release artifacts on top of the NetBSD 11.0_RC4 baseline",
+        "Integrated additional upstream bug fixes from the RC4 cycle",
+        "Continued focus on release stability and predictable behavior"
+      ]
     }
   ]
 }
