@@ -1,11 +1,11 @@
 # shell build profile for scripts/run-pipeline.sh
 
-TARGET="neobsd-11"
+TARGET="netbsd-11"
 
-BUILD_BRAND_NAME="NeoBSD"
-BUILD_ID_PREFIX="neobsd"
+BUILD_BRAND_NAME="NetBSD"
+BUILD_ID_PREFIX="netbsd"
 
-GIT_COMMITTER_NAME="NeoBSD Builder"
+GIT_COMMITTER_NAME="NetBSD Builder"
 GIT_COMMITTER_EMAIL="builder@n00101.lan"
 
 SRC_DIR="/build/netbsd-src"

@@ -6,7 +6,7 @@ BUILD_BRAND_NAME="NeoBSD"
 BUILD_ID_PREFIX="neobsd"
 
 GIT_COMMITTER_NAME="NeoBSD Builder"
-GIT_COMMITTER_EMAIL="builder@builder.lan"
+GIT_COMMITTER_EMAIL="builder@n00101.lan"
 
 SRC_DIR="/build/netbsd-src"
 XSRC_DIR="/build/netbsd-xsrc"
